@@ -31,6 +31,13 @@ public:
     void ToggleAntiSlowdown(bool enabled);
     bool IsAntiSlowdownEnabled() const;
 
+    // Event counter record (Information only) — gates the EVPS/dispatch
+    // stats accumulator, NOT playback advancement. See PlaybackThread():
+    // eventPos must always increment regardless of this flag, or the
+    // playback loop stalls when recording is disabled.
+    void ToggleEventCounterRecord(bool enabled);
+    bool IsEventCounterRecordEnabled() const;
+
     // ---------------------------------------------------------------
     // Lag Simulator — limits MIDI sends to N events/sec (0 = off).
     // Mimics PFA behaviour on a slow machine: dense chord bursts cause
@@ -42,6 +49,24 @@ public:
     bool    IsSimulateLagActive() const;             // true = currently throttled
 	void    SetLagSmoothRender(bool smooth);
     bool    GetLagSmoothRender() const;
+
+	// ── Events-per-second counter (reset each frame by the render thread) ──
+	std::atomic<uint64_t> eventsDispatchedCounter{ 0 };
+	uint64_t GetAndResetEventCount() {
+		return eventsDispatchedCounter.exchange(0, std::memory_order_relaxed);
+	}
+	
+	// ── EVPS sliding-window ring buffer (100 × 10ms = 1 second) ──────────
+	static constexpr int kEvpsBuckets = 100;
+	struct EvpsBucket {
+		std::atomic<int64_t>  startMs{ -1 };  // wall-clock ms, -1 = unused
+		std::atomic<uint64_t> count{ 0 };
+	};
+	EvpsBucket              m_evpsBuckets[kEvpsBuckets];
+	std::atomic<int>        m_evpsCurBucket{ 0 };
+
+	void RecordDispatch(uint64_t count = 1); // Modified to accept a batch count
+	uint64_t GetEventsPerSecond() const;
 
 private:
     void PlaybackThread();
@@ -80,6 +105,7 @@ private:
 	uint64_t TickToMicros(uint64_t targetTick) const;
 	void     LoopBackToTick(uint64_t loopStart);
     std::atomic<bool> antiSlowdownEnabled{false};
+    std::atomic<bool> eventCounterRecordEnabled{true}; // default on: stats work out of the box
 	bool activeNotes[16][128] = {};
 
     // ---- Lag simulator state ------------------------------------------------
@@ -91,6 +117,8 @@ private:
     double   simTokens{0.0};
     std::chrono::steady_clock::time_point simLastRefill;
 	std::atomic<bool> simLagSmooth{false};
+	mutable std::atomic<uint64_t> m_cachedEps{0};
+    mutable std::atomic<int64_t>  m_lastEpsUpdateMs{0};
 };
 
 // ---------------------------------------------------------------

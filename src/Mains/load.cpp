@@ -13,7 +13,6 @@
 
 #include <cstdio>
 #include <algorithm>
-#include <unordered_map>
 #include <cstring>
 #include <stdexcept>
 #include <cassert>
@@ -104,16 +103,11 @@ struct MidiReader {
     }
 };
 
-using NoteKey = uint32_t;
 struct PendingNote {
     uint32_t startTick;
     uint8_t  velocity;
     uint8_t  visualTrack; 
 };
-
-inline NoteKey makeNoteKey(uint8_t ch, uint8_t note) {
-    return ((uint32_t)ch << 7) | note;
-}
 
 } // namespace
 
@@ -147,7 +141,6 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
 
             uint8_t statusByte = r.readU8(); consume(1);
 
-            // RUNNING STATUS FIX: Channel msgs (< 0xF0) update running status
             if (statusByte & 0x80) {
                 if (statusByte < 0xF0) runStatus = statusByte;
             }
@@ -189,8 +182,7 @@ std::vector<CCEvent> loadStreamingMidiData(
     const std::string& filename, std::vector<OptimizedTrackData>& tracks,
     int& ppq, int& initialTempo, uint64_t& totalNoteCount,
     uint16_t& outTimeSigNumerator, uint16_t& outTimeSigDenominator,
-    LoadProgress* progress)
-{
+    LoadProgress* progress, bool removeOverlaps) {
     if (progress) progress->loadPhase = 1;
     MidiReader r(filename, progress ? &progress->bytesRead : nullptr);
     if (progress) progress->totalBytes = r.totalSize;
@@ -203,7 +195,7 @@ std::vector<CCEvent> loadStreamingMidiData(
     s_globalEvents.clear();
 
     if (r.totalSize > 0) {
-        size_t estimatedEvents = r.totalSize / 10; 
+        size_t estimatedEvents = r.totalSize / 4; 
         s_globalEvents.reserve(estimatedEvents);
         ccEvents.reserve(estimatedEvents / 8);     
     }
@@ -227,12 +219,12 @@ std::vector<CCEvent> loadStreamingMidiData(
             td.notes.reserve(std::max<size_t>(notesPerTrack, 1024));
     }
 
-    std::vector<std::unordered_map<NoteKey, std::vector<PendingNote>>> pendingNotes(visualTrackCount);
+    std::vector<PendingNote> pendingNotes[16][128];
 
     for (uint16_t trackIdx = 0; trackIdx < nTracks && !r.eof(); ++trackIdx) {
         uint32_t chunkId  = r.readU32();
         uint32_t chunkLen = r.readU32();
-		if (progress) progress->currentTrack = trackIdx + 1;
+        if (progress) progress->currentTrack = trackIdx + 1;
 
         if (chunkId != 0x4D54726B) {  
             r.skip(chunkLen);
@@ -258,7 +250,6 @@ std::vector<CCEvent> loadStreamingMidiData(
             if (bytesLeft == 0) break;
             uint8_t statusByte = r.readU8(); bytesLeft--;
 
-            // RUNNING STATUS FIX: Must preserve channel state during Meta/SysEx
             uint8_t firstData = 0xFF; 
             if (statusByte & 0x80) {
                 if (statusByte < 0xF0) {
@@ -282,15 +273,15 @@ std::vector<CCEvent> loadStreamingMidiData(
                 }
 
                 if (metaType == 0x51 && metaLen == 3 && bytesLeft >= 3) {
-                    uint32_t tempoVal = r.readU24(); bytesLeft -= 3;
-                    if (absTick == 0 && s_globalEvents.empty() &&
-                        initialTempo == (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS) {
-                        initialTempo = (int)tempoVal;
-                    }
-                    MidiEvent ev(absTick, EventType::TEMPO, 0);
-                    ev.data.tempo = tempoVal;   
-                    s_globalEvents.push_back(ev);
-                } else if (metaType == 0x58 && metaLen == 4 && bytesLeft >= 4) {
+					uint32_t tempoVal = r.readU24(); bytesLeft -= 3;
+					if (absTick == 0 && s_globalEvents.empty() &&
+						initialTempo == (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS) {
+						initialTempo = (int)tempoVal;
+					}
+					MidiEvent ev(absTick, EventType::TEMPO, 0);
+					ev.setTempo(tempoVal);   
+					s_globalEvents.push_back(ev);
+				} else if (metaType == 0x58 && metaLen == 4 && bytesLeft >= 4) {
                     uint8_t nn = r.readU8(); bytesLeft--;
                     uint8_t dd = r.readU8(); bytesLeft--;
                     r.readU8(); bytesLeft--; 
@@ -341,16 +332,12 @@ std::vector<CCEvent> loadStreamingMidiData(
             };
 
             auto doNoteOff = [&](uint8_t note) {
-                MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
-                ev.data.note.n = note;
-                ev.data.note.v = 0;
-                s_globalEvents.push_back(ev); // Pure unfiltered Note-Off for OmniMIDI Reference Counter
+			MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
+			ev.setNote(note, 0);
+			s_globalEvents.push_back(ev);
 
-                NoteKey key = makeNoteKey(channel, note);
-                auto& pm    = pendingNotes[vtrack];
-                auto  it    = pm.find(key);
-                if (it != pm.end() && !it->second.empty()) {
-                    auto& list = it->second;
+                auto& list = pendingNotes[channel][note];
+                if (!list.empty()) {
                     auto oldest = list.begin();
                     NoteEvent ne{};
                     ne.startTick   = oldest->startTick;
@@ -361,109 +348,97 @@ std::vector<CCEvent> loadStreamingMidiData(
                     ne.visualTrack = oldest->visualTrack;
                     tracks[vtrack].notes.push_back(ne);
                     totalNoteCount++;
-					if (progress && (totalNoteCount % 500 == 0)) {
-						progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
-					}
-                    list.erase(oldest);
-                    if (list.empty()) {
-                        pm.erase(it);
+                    if (progress && (totalNoteCount % 500 == 0)) {
+                        progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
+                    list.erase(oldest);
                 }
             };
 
             switch (evType) {
-				case 0x80: {   
-					uint8_t note = readData();
-					readData(); 
-					doNoteOff(note);
-					break;
-				}
-				case 0x90: {   
+                case 0x80: {   
+                    uint8_t note = readData();
+                    readData(); 
+                    doNoteOff(note);
+                    break;
+                }
+                case 0x90: {   
 					uint8_t note = readData();
 					uint8_t vel  = readData();
 					if (vel == 0) {
 						doNoteOff(note); 
 					} else {
 						MidiEvent ev(absTick, EventType::NOTE_ON, channel);
-						ev.data.note.n = note;
-						ev.data.note.v = vel;
+						ev.setNote(note, vel);
 						s_globalEvents.push_back(ev);
 						
-						NoteKey key = makeNoteKey(channel, note);
-						auto& pm    = pendingNotes[vtrack];
-						pm[key].push_back(PendingNote{ absTick, vel, vtrack });
+						pendingNotes[channel][note].push_back(PendingNote{ absTick, vel, vtrack });
 					}
-                break;
-            }
-            case 0xB0: {   
-                uint8_t ctrl = readData();
-                uint8_t val  = readData();
-                
-                // Prevent mass voice assassination by ignoring panic CCs
-                if (ctrl == 120 || ctrl == 121 || ctrl == 123) {
+					break;
+				}
+				case 0xB0: {   
+					uint8_t ctrl = readData();
+					uint8_t val  = readData();
+					if (ctrl == 120 || ctrl == 121 || ctrl == 123) {
+						break;
+					}
+					{
+						MidiEvent ev(absTick, EventType::CC, channel);
+						ev.setCC(ctrl, val);
+						s_globalEvents.push_back(ev);
+
+                        CCEvent cc{};
+                        cc.tick       = absTick;
+                        cc.channel    = channel;
+                        cc.controller = ctrl;
+                        cc.value      = val;
+                        ccEvents.push_back(cc);
+                    }
                     break;
                 }
-                
-                {
-                    MidiEvent ev(absTick, EventType::CC, channel);
-                    ev.data.cc.c = ctrl;
-                    ev.data.cc.v = val;
-                    s_globalEvents.push_back(ev);
-
-                    CCEvent cc{};
-                    cc.tick       = absTick;
-                    cc.channel    = channel;
-                    cc.controller = ctrl;
-                    cc.value      = val;
-                    ccEvents.push_back(cc);
+                case 0xE0: {   
+					uint8_t lsb = readData();
+					uint8_t msb = readData();
+					MidiEvent ev(absTick, EventType::PITCH_BEND, channel);
+					ev.setPitchBend(lsb, msb);
+					s_globalEvents.push_back(ev);
+					break;
+				}
+				case 0xC0: {   
+					uint8_t prog = readData();
+					MidiEvent ev(absTick, EventType::PROGRAM_CHANGE, channel);
+					ev.setValue(prog);
+					s_globalEvents.push_back(ev);
+					break;
+				}
+				case 0xD0: {   
+					uint8_t pressure = readData();
+					MidiEvent ev(absTick, EventType::CHANNEL_PRESSURE, channel);
+					ev.setValue(pressure);
+					s_globalEvents.push_back(ev);
+					break;
+				} case 0xA0: {   
+                    readData(); readData();
+                    break;
                 }
-                break;
-            }
-            case 0xE0: {   
-                uint8_t lsb = readData();
-                uint8_t msb = readData();
-                MidiEvent ev(absTick, EventType::PITCH_BEND, channel);
-                ev.data.raw.l1 = lsb;
-                ev.data.raw.m2 = msb;
-                s_globalEvents.push_back(ev);
-                break;
-            }
-            case 0xC0: {   
-                uint8_t prog = readData();
-                MidiEvent ev(absTick, EventType::PROGRAM_CHANGE, channel);
-                ev.data.val = prog;
-                s_globalEvents.push_back(ev);
-                break;
-            }
-            case 0xD0: {   
-                uint8_t pressure = readData();
-                MidiEvent ev(absTick, EventType::CHANNEL_PRESSURE, channel);
-                ev.data.val = pressure;
-                s_globalEvents.push_back(ev);
-                break;
-            }
-            case 0xA0: {   
-                readData(); readData();
-                break;
-            }
-            default:
-                if (firstData != 0xFF) {  }
-                else { if (bytesLeft > 0) { r.readU8(); bytesLeft--; } }
-                break;
+                default:
+                    if (firstData != 0xFF) {  }
+                    else { if (bytesLeft > 0) { r.readU8(); bytesLeft--; } }
+                    break;
             }
         }
 
-        for (auto& pm : pendingNotes) {
-            for (auto& [key, list] : pm) {
+        // Flush active notes at end-of-track boundary
+        for (int ch = 0; ch < 16; ++ch) {
+            for (int n = 0; n < 128; ++n) {
+                auto& list = pendingNotes[ch][n];
                 for (auto& pn : list) {
-                    uint8_t note    = key & 0x7F;
-                    uint8_t channel = (key >> 7) & 0x0F;
                     NoteEvent ne{};
                     ne.startTick  = pn.startTick;
                     ne.endTick    = absTick;   
-                    ne.note       = note;
+                    ne.note       = n;
                     ne.velocity   = pn.velocity;
-                    ne.channel    = channel;
+                    ne.channel    = ch;
                     ne.visualTrack= pn.visualTrack;
                     if (ne.visualTrack < (uint8_t)tracks.size())
                         tracks[ne.visualTrack].notes.push_back(ne);
@@ -472,8 +447,8 @@ std::vector<CCEvent> loadStreamingMidiData(
                         progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
                 }
+                list.clear();
             }
-            pm.clear();
         }
 
         if (bytesLeft > 0) r.skip((uint32_t)bytesLeft);
@@ -482,6 +457,72 @@ std::vector<CCEvent> loadStreamingMidiData(
 	if (progress) {
         progress->currentNotes = totalNoteCount;
         progress->loadPhase = 2; 
+    }
+
+    // ── Overlap & Duplicate Remover Filter (Conditional) ────────────────────
+    if (removeOverlaps) {
+        for (auto& td : tracks) {
+            if (td.notes.empty()) continue;
+
+            // Sort by note pitch first, then channel, then startTick, then endTick descending
+            std::sort(td.notes.begin(), td.notes.end(),
+                [](const NoteEvent& a, const NoteEvent& b){
+                    if (a.note != b.note) return a.note < b.note;
+                    if (a.channel != b.channel) return a.channel < b.channel;
+                    if (a.startTick != b.startTick) return a.startTick < b.startTick;
+                    return a.endTick > b.endTick;
+                });
+
+            std::vector<NoteEvent> cleanNotes;
+            cleanNotes.reserve(td.notes.size());
+            cleanNotes.push_back(td.notes[0]);
+
+            for (size_t i = 1; i < td.notes.size(); ++i) {
+                const auto& next = td.notes[i];
+                auto& last = cleanNotes.back();
+
+                if (last.note == next.note && last.channel == next.channel) {
+                    // If they start on the exact same tick, discard the duplicate shorter one
+                    if (last.startTick == next.startTick) {
+                        continue; 
+                    }
+                    // Truncate previous note if it extends into/past the start of the next note
+                    if (last.endTick > next.startTick) {
+                        last.endTick = next.startTick;
+                    }
+                    // Safety floor clamp
+                    if (last.endTick <= last.startTick) {
+                        last.endTick = last.startTick + 1;
+                    }
+                }
+                cleanNotes.push_back(next);
+            }
+
+            td.notes = std::move(cleanNotes);
+
+            // Restore startTick sorting for visualizer compatibility
+            std::sort(td.notes.begin(), td.notes.end(),
+                [](const NoteEvent& a, const NoteEvent& b){
+                    return a.startTick < b.startTick;
+                });
+            td.notes.shrink_to_fit(); 
+        }
+
+        // Recalculate true visual note count
+        totalNoteCount = 0;
+        for (const auto& td : tracks) {
+            totalNoteCount += td.notes.size();
+        }
+    } else {
+        // If bypass overlap removal, still sort tracks by startTick so binary search functions
+        for (auto& td : tracks) {
+            if (td.notes.empty()) continue;
+            std::sort(td.notes.begin(), td.notes.end(),
+                [](const NoteEvent& a, const NoteEvent& b){
+                    return a.startTick < b.startTick;
+                });
+            td.notes.shrink_to_fit();
+        }
     }
 
     std::sort(s_globalEvents.begin(), s_globalEvents.end(),
@@ -493,9 +534,6 @@ std::vector<CCEvent> loadStreamingMidiData(
             
             auto pri = [](uint8_t t) -> int {
 				if (t == (uint8_t)EventType::TEMPO)    return 0;
-                // FIX: Must process NOTE_OFF BEFORE NOTE_ON for back-to-back notes!
-                // If a note ends and another begins on the exact same tick, the OFF must happen 
-                // first, otherwise it will instantly assassinate the newly started note!
 				if (t == (uint8_t)EventType::NOTE_OFF) return 1;
 				if (t == (uint8_t)EventType::NOTE_ON)  return 2;
 				return 3;
@@ -505,14 +543,6 @@ std::vector<CCEvent> loadStreamingMidiData(
         });
 
     s_globalEvents.shrink_to_fit(); 
-
-    for (auto& td : tracks) {
-        std::sort(td.notes.begin(), td.notes.end(),
-            [](const NoteEvent& a, const NoteEvent& b){
-                return a.startTick < b.startTick;
-            });
-        td.notes.shrink_to_fit(); 
-    }
 
     std::sort(ccEvents.begin(), ccEvents.end(),
         [](const CCEvent& a, const CCEvent& b){

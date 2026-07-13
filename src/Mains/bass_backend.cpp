@@ -1,5 +1,8 @@
 #ifdef _WIN32
 
+// Prevent Windows GDI and USER API name collisions with Raylib
+#define NOGDI
+#define NOUSER
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
@@ -20,24 +23,7 @@
 #include <condition_variable>
 
 #include "bass_backend.hpp"
-
-#ifndef MIDI_EVENT_TYPES_DEFINED
-#define MIDI_EVENT_TYPES_DEFINED
-enum class EventType : uint8_t { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
-struct MidiEvent {
-    uint32_t tick;
-    uint8_t  type;
-    uint8_t  channel;
-    uint16_t _pad{0};
-    union {
-        struct { uint8_t n; uint8_t v; } note;
-        struct { uint8_t c; uint8_t v; } cc;
-        struct { uint8_t l1; uint8_t m2; } raw;
-        uint8_t  val;
-        uint32_t tempo;
-    } data;
-};
-#endif
+#include "visualizer.hpp"
 
 #ifndef BASS_ATTRIB_MIDI_VOICES
 #  define BASS_ATTRIB_MIDI_VOICES    0x12000
@@ -132,17 +118,12 @@ struct BassPreRenderEngine::Impl {
         if (fe.handle) { BASS_MIDI_FontFree((HSOUNDFONT)fe.handle); fe.handle = 0; }
     }
 
-    // Returns a velocity-ignore threshold that scales with buffer health.
-    //   bufHealthSec >= lowVelScaleMaxSec  → use cfg.velocityIgnore (normal, e.g. 2)
-    //   bufHealthSec == 0.0f              → return 127 (silence all new notes)
-    // The 10ms low end comes from cfg.latencyMs — below that we're basically empty.
     uint8_t GetDynamicVelIgnore(double bufHealthSec) const {
         const float scaleMax = cfg.lowVelScaleMaxSec;
-        if (scaleMax <= 0.0f) return cfg.velocityIgnore; // feature disabled
-        if (bufHealthSec <= 0.0) return 127; // buffer completely dry → silence
-        if (bufHealthSec >= (double)scaleMax) return cfg.velocityIgnore; // healthy → normal
-        // Linear interpolation: 0s → 127, scaleMax → cfg.velocityIgnore
-        float t = (float)(bufHealthSec / (double)scaleMax); // 0..1
+        if (scaleMax <= 0.0f) return cfg.velocityIgnore; 
+        if (bufHealthSec <= 0.0) return 127; 
+        if (bufHealthSec >= (double)scaleMax) return cfg.velocityIgnore; 
+        float t = (float)(bufHealthSec / (double)scaleMax); 
         float result = 127.0f + t * ((float)cfg.velocityIgnore - 127.0f);
         return (uint8_t)std::clamp((int)result, (int)cfg.velocityIgnore, 127);
     }
@@ -205,12 +186,9 @@ bool BassPreRenderEngine::Init(void* hwnd) {
     if (impl->initialized) return true;
     impl->hwnd = hwnd;
 
-    // Use latencyMs directly for both update period and buffer size.
-    // Halving the update period caused a doubled device-poll interval mismatch
-    // that manifested as a ~1 second response lag when settings changed.
     int updateMs = std::max(1, impl->cfg.latencyMs);
     BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, updateMs);
-    BASS_SetConfig(BASS_CONFIG_BUFFER, updateMs * 2); // 2x update for safe device buffer
+    BASS_SetConfig(BASS_CONFIG_BUFFER, updateMs * 2);
 
     if (!BASS_Init(-1, impl->cfg.sampleRate, 0, (HWND)hwnd, nullptr)) {
         DWORD err = BASS_ErrorGetCode();
@@ -318,7 +296,6 @@ void BassPreRenderEngine::SetPreRenderBufferSec(float sec) {
     if (!impl) return;
     float old = impl->cfg.preRenderBufferSec;
     impl->cfg.preRenderBufferSec = std::clamp(sec, 1.0f, 1800.0f); 
-    // Trigger seamless non-destructive array resize
     if (impl->cfg.mode == AudioMode::BassMIDI_PreRender && impl->prRunning.load() && old != impl->cfg.preRenderBufferSec) {
         impl->prNeedsResize.store(true);
         impl->pcmCV.notify_all();
@@ -450,9 +427,6 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
     
     if (impl->pushStream) {
         BASS_ChannelSetAttribute(impl->pushStream, BASS_ATTRIB_VOL, impl->volume);
-        // Do NOT start playback here. Play() will be called once the buffer reaches
-        // a minimum health threshold so R (reset) doesn't pause mid-decode.
-        std::cout << "[BassEngine] Pre-render stream ready (waiting for buffer fill before play)\n";
     }
 
     impl->prProgress.store(0.0f);
@@ -465,13 +439,8 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
 
     impl->prThread = std::thread([this, device, sr]() mutable {
         BASS_SetDevice(device);
-        // Hysteresis counter: how many consecutive decode chunks have seen a different
-        // velIgnore from what is baked. Only rebuild after 8 stable chunks to prevent loops.
 
         auto buildStream = [&]() -> HSTREAM {
-            // Use cfg.velocityIgnore directly — buffer health is always 0 at build time
-            // (decode hasn't started yet), so GetDynamicVelIgnore would always return 127
-            // and bake silence into every stream. Vel ignore is a static config, not dynamic.
             const uint8_t velIgnore  = impl->cfg.velocityIgnore;
             const bool    sfxEnabled = impl->cfg.sfxEnabled;
             const float   speed      = impl->playbackSpeed;
@@ -497,7 +466,7 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                 auto et = static_cast<EventType>(ev.type);
                 bool skip = false;
                 if (et == EventType::NOTE_ON) {
-                    uint8_t vel = ev.data.note.v;
+                    uint8_t vel = ev.getVelocity();
                     if (vel > 0 && vel <= velIgnore) skip = true;
                 } else if (!sfxEnabled) {
                     if (et == EventType::CC || et == EventType::PITCH_BEND || et == EventType::PROGRAM_CHANGE || et == EventType::CHANNEL_PRESSURE) skip = true;
@@ -509,7 +478,7 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                 lastWrittenTick = ev.tick;
 
                 if (et == EventType::TEMPO) {
-                    uint32_t t = (uint32_t)(ev.data.tempo / speed);
+                    uint32_t t = (uint32_t)(ev.getTempo() / speed);
                     writeVlq(trackData, delta);
                     trackData.push_back(0xFF); trackData.push_back(0x51); trackData.push_back(0x03);
                     trackData.push_back((uint8_t)((t >> 16) & 0xFF));
@@ -518,62 +487,52 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                 } else if (et == EventType::NOTE_ON) {
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0x90 | ev.channel));
-                    trackData.push_back(ev.data.note.n);
-                    trackData.push_back(ev.data.note.v);
+                    trackData.push_back(ev.getNote());
+                    trackData.push_back(ev.getVelocity());
                 } else if (et == EventType::NOTE_OFF) {
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0x80 | ev.channel));
-                    trackData.push_back(ev.data.note.n);
-                    trackData.push_back(ev.data.note.v);
+                    trackData.push_back(ev.getNote());
+                    trackData.push_back(ev.getVelocity());
                 } else if (et == EventType::CC) {
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0xB0 | ev.channel));
-                    trackData.push_back(ev.data.cc.c);
-                    trackData.push_back(ev.data.cc.v);
+                    trackData.push_back(ev.getCCController());
+                    trackData.push_back(ev.getCCValue());
                 } else if (et == EventType::PITCH_BEND) {
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0xE0 | ev.channel));
-                    trackData.push_back(ev.data.raw.l1);
-                    trackData.push_back(ev.data.raw.m2);
+                    trackData.push_back(ev.getPitchBendLSB());
+                    trackData.push_back(ev.getPitchBendMSB());
                 } else if (et == EventType::PROGRAM_CHANGE) {
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0xC0 | ev.channel));
-                    trackData.push_back(ev.data.val);
+                    trackData.push_back(ev.getValue());
                 }
             }
 
-            // Tail: BASS MIDI ends decode as soon as all voices are silent —
-            // CC events and bare delta ticks are ignored once voices stop.
-            // Solution: mute channel 15 with CC7=0, send a NOTE_ON to create
-            // a real voice, wait tailTicks, NOTE_OFF. The voice keeps BASS
-            // rendering audio (= release envelopes + reverb from real channels)
-            // while outputting silence itself (CC7=0).
+            // Append silent EOT padding
             {
                 uint32_t lastTempo = impl->cachedInitialTempo;
                 for (const auto& ev : impl->cachedEvents)
                     if (static_cast<EventType>(ev.type) == EventType::TEMPO)
-                        lastTempo = ev.data.tempo;
+                        lastTempo = ev.getTempo();
 
                 double secsPerTick = (lastTempo / 1000000.0) / impl->cachedPpq;
                 uint32_t tailTicks = (secsPerTick > 0.0)
                     ? (uint32_t)(3.0 / secsPerTick)
                     : (impl->cachedPpq * 6);
 
-                // All notes off + sustain off on all channels
                 for (uint8_t ch = 0; ch < 16; ++ch) {
                     writeVlq(trackData, 0); trackData.push_back(0xB0 | ch); trackData.push_back(123); trackData.push_back(0);
                     writeVlq(trackData, 0); trackData.push_back(0xB0 | ch); trackData.push_back(64);  trackData.push_back(0);
                 }
-                // Mute ch15 with CC7=0 so the tail note is inaudible
                 writeVlq(trackData, 0); trackData.push_back(0xBF); trackData.push_back(7); trackData.push_back(0);
-                // NOTE_ON ch15 note=60 vel=1 — creates a real voice, keeps BASS alive
                 writeVlq(trackData, 0); trackData.push_back(0x9F); trackData.push_back(60); trackData.push_back(1);
-                // Wait tailTicks — BASS renders real release/reverb from other channels
                 writeVlq(trackData, tailTicks);
-                // NOTE_OFF ch15 note=60
                 trackData.push_back(0x8F); trackData.push_back(60); trackData.push_back(0);
                 writeVlq(trackData, 0);
-                trackData.push_back(0xFF); trackData.push_back(0x2F); trackData.push_back(0x00); // EOT
+                trackData.push_back(0xFF); trackData.push_back(0x2F); trackData.push_back(0x00); 
             }
 
             std::vector<uint8_t> midiFile;
@@ -629,7 +588,6 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                 decStream = buildStream();
                 impl->lastRenderedSpeed = impl->playbackSpeed;
 
-                
                 if (!decStream) {
                     impl->prError.store(true);
                     break;
@@ -696,7 +654,7 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
 
             uint64_t space = 0;
             uint64_t capacity = impl->pcm.size();
-            const uint64_t minSpace = kDecodeChunk / sizeof(float); // wait for room for at least 1 chunk
+            const uint64_t minSpace = kDecodeChunk / sizeof(float);
             {
                 std::unique_lock<std::mutex> lk(impl->pcmMutex);
                 impl->pcmCV.wait(lk, [&]{ 
@@ -737,22 +695,14 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
             decoded += got;
             if (totalBytes > 0) impl->prProgress.store(std::min(1.0f, (float)decoded / (float)totalBytes));
 
-            // Only yield when the buffer is nearly full (>80% capacity) so the
-            // visualizer thread gets CPU time. Never sleep when buffer is thin —
-            // that was the root cause of the sawtooth drain pattern.
             {
                 uint64_t capacity = impl->pcm.size();
                 uint64_t used     = 0;
                 { std::lock_guard<std::mutex> lk(impl->pcmMutex); used = impl->pcmWritePos - impl->pcmReadPos; }
 
                 if (used > capacity * 8 / 10)
-                    std::this_thread::yield(); // buffer healthy: be polite to other threads
+                    std::this_thread::yield(); 
 
-                // ── Option A: Dynamic Voice Count (linear) ───────────────────
-                // decStream is a BASS_MIDI_StreamCreateFile decode stream, so
-                // BASS_ATTRIB_MIDI_VOICES applies directly to it.
-                // Linearly scale voices from cfg.voices down to lowBufferMinVoices
-                // as health drops from 2.0s to 0.0s.
                 if (decStream) {
                     double health = (double)used / 2.0 / impl->cfg.sampleRate;
                     const double fullSec = 2.0;
@@ -762,11 +712,10 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                     if (health >= fullSec) {
                         targetVoices = maxV;
                     } else {
-                        float t = (float)(health / fullSec); // 0..1
+                        float t = (float)(health / fullSec); 
                         targetVoices = (int)(minV + t * (maxV - minV));
                         targetVoices = std::clamp(targetVoices, minV, maxV);
                     }
-                    // Only call SetAttribute when value actually changes
                     static int s_lastVoices = -1;
                     if (targetVoices != s_lastVoices) {
                         BASS_ChannelSetAttribute(decStream, BASS_ATTRIB_MIDI_VOICES, (float)targetVoices);
@@ -817,7 +766,6 @@ void BassPreRenderEngine::SendMidiData(uint32_t msg) {
     const uint8_t status  = msg & 0xFF;
     const uint8_t data1   = (msg >> 8) & 0xFF;
     const uint8_t data2   = (msg >> 16) & 0xFF;
-    // Use dynamic velocity ignore (scales with buffer health in pre-render mode)
     double bufHealth = GetBufferHealthSeconds();
     uint8_t velIgnore = impl->GetDynamicVelIgnore(bufHealth);
     if ((status & 0xF0) == 0x90 && data2 <= velIgnore && data2 > 0) return;
@@ -833,14 +781,7 @@ void BassPreRenderEngine::Play() {
     if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
         if (!impl->pushStream) return;
 
-        // If the stream hasn't started yet, wait until we have at least latencyMs
-        // worth of audio in the buffer before kicking BASS. This prevents the stall
-        // that happened when R (reset) triggered a new StartPreRender and Play()
-        // fired before the decode thread had written anything.
         if (BASS_ChannelIsActive(impl->pushStream) == BASS_ACTIVE_STOPPED) {
-            // Wait for at least 1 second of audio before starting playback.
-            // 20ms (latencyMs*2) was too small — the stream started before the
-            // decode thread had written anything audible, causing silence on load.
             const double minFillSec = 1.0;
             double health = GetBufferHealthSeconds();
             if (health < minFillSec && impl->prRunning.load()) {

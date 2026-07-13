@@ -1,10 +1,11 @@
+// midioutput.cpp
 #include "midioutput.hpp"
 #include "bass_backend.hpp"   
 
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 
-// ── KDMAPI prototype ──────────────────────────────────────────────────────────
 extern "C" {
     void SendDirectData(unsigned long data);
 }
@@ -14,8 +15,6 @@ MidiOutputEngine::MidiOutputEngine() :
     eventList(nullptr), currentPpq(480), currentVisualizerTick(0), playbackSpeed(1.0f) {
 }
 
-// Build a compact index of tempo-change points so Seek() can jump in O(log M)
-// rather than scanning O(N) events. Called once inside Start().
 void MidiOutputEngine::BuildTempoIndex() {
     tempoIndex.clear();
     if (!eventList) return;
@@ -33,7 +32,7 @@ void MidiOutputEngine::BuildTempoIndex() {
 
         accumMicros  += (ev.tick - tick) * microsPerTick;
         tick          = ev.tick;
-        rawTempo      = ev.data.tempo;
+        rawTempo      = ev.getTempo(); // Corrected: replaced ev.data.tempo with ev.getTempo()
         microsPerTick = MidiTiming::CalculateMicrosecondsPerTick(rawTempo, currentPpq);
 
         tempoIndex.push_back({ i, tick, accumMicros, rawTempo });
@@ -48,7 +47,14 @@ bool MidiOutputEngine::IsAntiSlowdownEnabled() const {
     return antiSlowdownEnabled.load();
 }
 
-// ── Lag Simulator API ─────────────────────────────────────────────────────────
+void MidiOutputEngine::ToggleEventCounterRecord(bool enabled) {
+    eventCounterRecordEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool MidiOutputEngine::IsEventCounterRecordEnabled() const {
+    return eventCounterRecordEnabled.load(std::memory_order_relaxed);
+}
+
 void MidiOutputEngine::SetSimulateEventsPerSecond(int64_t eps) {
     simulateEventsPerSecond.store(eps > 0 ? eps : 0);
     if (eps <= 0) simLagActive.store(false);
@@ -88,14 +94,12 @@ void MidiOutputEngine::Start(const std::vector<MidiEvent>& events, int ppq, uint
     isFinished = false;
     isPaused = false;
 
-    // Reset lag-simulator token bucket
     simTokens    = 0.0;
     simLagActive = false;
     simLastRefill = std::chrono::steady_clock::now();
 
     BuildTempoIndex();
 
-    // Compute total song duration from the tempo index + remaining ticks.
     if (g_BassEngine.IsInitialized() &&
         g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender &&
         !events.empty())
@@ -108,7 +112,7 @@ void MidiOutputEngine::Start(const std::vector<MidiEvent>& events, int ppq, uint
                 if (ev.type == (uint8_t)EventType::TEMPO) {
                     totalMicros += (uint64_t)((ev.tick - lastTick) * usPerTick);
                     lastTick     = ev.tick;
-                    usPerTick    = MidiTiming::CalculateMicrosecondsPerTick(ev.data.tempo, ppq);
+                    usPerTick    = MidiTiming::CalculateMicrosecondsPerTick(ev.getTempo(), ppq); // Corrected: replaced ev.data.tempo with ev.getTempo()
                 }
             }
             totalMicros += (uint64_t)((events.back().tick - lastTick) * usPerTick);
@@ -133,7 +137,6 @@ void MidiOutputEngine::Stop() {
     SilenceAllChannels();
     isPlaying = false;
 
-    // Mirror stop to BassMIDI if active
     if (g_BassEngine.IsInitialized() &&
         g_BassEngine.GetActiveMode() != AudioMode::KDMAPI)
         g_BassEngine.Stop();
@@ -167,10 +170,10 @@ void MidiOutputEngine::Resume() {
 
 void MidiOutputEngine::SilenceAllChannels() {
     for (int ch = 0; ch < 16; ++ch) {
-        DispatchMidiOut((0xB0 | ch) | (123 << 8)); // All Notes Off
-        DispatchMidiOut((0xB0 | ch) | (121 << 8)); // Reset All Controllers
+        DispatchMidiOut((0xB0 | ch) | (123 << 8)); 
+        DispatchMidiOut((0xB0 | ch) | (121 << 8)); 
     }
-    memset(activeNotes, 0, sizeof(activeNotes)); // clear tracking table
+    memset(activeNotes, 0, sizeof(activeNotes)); 
 }
 
 void MidiOutputEngine::SilenceAllChannelsWithoutCC() {
@@ -192,7 +195,6 @@ void MidiOutputEngine::SetSpeed(float newSpeed) {
     }
     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, currentPpq);
     
-    // Alert the audio engine so pre-render streams can perfectly adapt to the new timing 
     if (g_BassEngine.IsInitialized()) {
         g_BassEngine.SetPlaybackSpeed(newSpeed);
     }
@@ -202,7 +204,6 @@ void MidiOutputEngine::SetLooping(bool loop) {
     isLooping = loop;
 }
 
-// ── Loop A/B Points ───────────────────────────────────────────────────────────
 void MidiOutputEngine::SetLoopPoints(uint64_t startTick, uint64_t endTick) {
     loopStartTick.store(startTick);
     loopEndTick.store(endTick);
@@ -219,8 +220,6 @@ bool     MidiOutputEngine::HasLoopPoints()    const { return hasLoopPoints.load(
 uint64_t MidiOutputEngine::GetLoopStartTick() const { return loopStartTick.load(); }
 uint64_t MidiOutputEngine::GetLoopEndTick()   const { return loopEndTick.load(); }
 
-// Convert a MIDI tick to accumulated microseconds using the tempo index.
-// Used internally by LoopBackToTick().
 uint64_t MidiOutputEngine::TickToMicros(uint64_t targetTick) const {
     if (tempoIndex.empty()) return 0;
     size_t lo = 0, hi = tempoIndex.size();
@@ -234,12 +233,9 @@ uint64_t MidiOutputEngine::TickToMicros(uint64_t targetTick) const {
     return (uint64_t)(seg.accumMicros + (double)(targetTick - seg.tick) * mpt);
 }
 
-// Inline seek to targetTick without pausing the thread.
-// Called from PlaybackThread only — do NOT call from outside the worker thread.
 void MidiOutputEngine::LoopBackToTick(uint64_t loopStart) {
     SilenceAllChannels();
 
-    // Binary-search tempoIndex for the segment that contains loopStart
     size_t segIdx = 0;
     {
         size_t lo = 0, hi = tempoIndex.size();
@@ -258,22 +254,49 @@ void MidiOutputEngine::LoopBackToTick(uint64_t loopStart) {
     size_t   newEP      = seg.eventIdx;
     uint32_t newLTick   = seg.tick;
 
-    // Scan forward through events until we reach the loop start tick
+    uint8_t chaseProgram[16];
+    uint16_t chasePitchBend[16];
+    uint8_t chaseCC[16][128];
+    std::memset(chaseProgram, 0xFF, sizeof(chaseProgram));
+    std::memset(chasePitchBend, 0xFF, sizeof(chasePitchBend));
+    std::memset(chaseCC, 0xFF, sizeof(chaseCC));
+
     while (newEP < eventList->size()) {
         const auto& ev = (*eventList)[newEP];
         if ((uint64_t)ev.tick >= loopStart) break;
         scanAccum = (uint64_t)(seg.accumMicros + (double)(ev.tick - seg.tick) * tempMPT);
         newLTick  = ev.tick;
         if (ev.type == (uint8_t)EventType::TEMPO) {
-            tempTempo = ev.data.tempo;
+            tempTempo = ev.getTempo(); // Corrected: replaced ev.data.tempo with ev.getTempo()
             tempMPT   = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, currentPpq);
+        } else if (ev.type == (uint8_t)EventType::CC) {
+            chaseCC[ev.channel][ev.getCCController()] = ev.getCCValue();
+        } else if (ev.type == (uint8_t)EventType::PROGRAM_CHANGE) {
+            chaseProgram[ev.channel] = ev.getValue();
+        } else if (ev.type == (uint8_t)EventType::PITCH_BEND) {
+            chasePitchBend[ev.channel] = (ev.getPitchBendMSB() << 8) | ev.getPitchBendLSB();
         }
         newEP++;
     }
 
+    for (int ch = 0; ch < 16; ++ch) {
+        if (chaseProgram[ch] != 0xFF) {
+            DispatchMidiOut((0xC0 | ch) | (chaseProgram[ch] << 8));
+        }
+        if (chasePitchBend[ch] != 0xFFFF) {
+            uint8_t lsb = chasePitchBend[ch] & 0xFF;
+            uint8_t msb = (chasePitchBend[ch] >> 8) & 0xFF;
+            DispatchMidiOut((0xE0 | ch) | (lsb << 8) | (msb << 16));
+        }
+        for (int c = 0; c < 128; ++c) {
+            if (chaseCC[ch][c] != 0xFF) {
+                DispatchMidiOut((0xB0 | ch) | (c << 8) | (chaseCC[ch][c] << 16));
+            }
+        }
+    }
+
     uint64_t startMicros = scanAccum + (uint64_t)((double)(loopStart - newLTick) * tempMPT);
 
-    // Apply new engine state
     accumulatedMicroseconds = (double)scanAccum;
     lastProcessedTick       = newLTick;
     eventPos                = newEP;
@@ -281,7 +304,6 @@ void MidiOutputEngine::LoopBackToTick(uint64_t loopStart) {
     microsecondsPerTick     = tempMPT;
     currentVisualizerTick   = loopStart;
 
-    // Re-anchor the clock so elapsedVirtualMicros == startMicros right now
     double spd = (double)playbackSpeed.load();
     uint64_t realOffset = (spd > 0.0) ? (uint64_t)((double)startMicros / spd) : 0ULL;
     playbackStartTime = std::chrono::steady_clock::now() - std::chrono::microseconds(realOffset);
@@ -342,6 +364,13 @@ void MidiOutputEngine::Seek(int64_t microsecondOffset) {
     eventPos          = seg.eventIdx;
     lastProcessedTick = seg.tick;
 
+    uint8_t chaseProgram[16];
+    uint16_t chasePitchBend[16];
+    uint8_t chaseCC[16][128];
+    std::memset(chaseProgram, 0xFF, sizeof(chaseProgram));
+    std::memset(chasePitchBend, 0xFF, sizeof(chasePitchBend));
+    std::memset(chaseCC, 0xFF, sizeof(chaseCC));
+
     while (eventPos < eventList->size()) {
         const auto& event = (*eventList)[eventPos];
         uint64_t eventScheduledTime = scanAccumulatedMicros +
@@ -350,12 +379,34 @@ void MidiOutputEngine::Seek(int64_t microsecondOffset) {
         scanAccumulatedMicros = eventScheduledTime;
         lastProcessedTick     = event.tick;
         if (event.type == (uint8_t)EventType::TEMPO) {
-            tempTempo         = event.data.tempo;
+            tempTempo         = event.getTempo(); // Corrected: replaced event.data.tempo with event.getTempo()
             tempMicrosPerTick = MidiTiming::CalculateMicrosecondsPerTick(tempTempo, currentPpq);
+        } else if (event.type == (uint8_t)EventType::CC) {
+            chaseCC[event.channel][event.getCCController()] = event.getCCValue();
+        } else if (event.type == (uint8_t)EventType::PROGRAM_CHANGE) {
+            chaseProgram[event.channel] = event.getValue();
+        } else if (event.type == (uint8_t)EventType::PITCH_BEND) {
+            chasePitchBend[event.channel] = (event.getPitchBendMSB() << 8) | event.getPitchBendLSB();
         }
         eventPos++;
     }
     
+    for (int ch = 0; ch < 16; ++ch) {
+        if (chaseProgram[ch] != 0xFF) {
+            DispatchMidiOut((0xC0 | ch) | (chaseProgram[ch] << 8));
+        }
+        if (chasePitchBend[ch] != 0xFFFF) {
+            uint8_t lsb = chasePitchBend[ch] & 0xFF;
+            uint8_t msb = (chasePitchBend[ch] >> 8) & 0xFF;
+            DispatchMidiOut((0xE0 | ch) | (lsb << 8) | (msb << 16));
+        }
+        for (int c = 0; c < 128; ++c) {
+            if (chaseCC[ch][c] != 0xFF) {
+                DispatchMidiOut((0xB0 | ch) | (c << 8) | (chaseCC[ch][c] << 16));
+            }
+        }
+    }
+
     currentTempo        = tempTempo;
     microsecondsPerTick = tempMicrosPerTick;
     accumulatedMicroseconds = scanAccumulatedMicros;
@@ -388,6 +439,47 @@ void MidiOutputEngine::SeekAbsolute(uint64_t targetMicros) {
     if (wasPlaying) Resume();
 }
 
+void MidiOutputEngine::RecordDispatch(uint64_t count) {
+    auto    now     = std::chrono::steady_clock::now();
+    int64_t nowMs   = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch()).count();
+    int     cur     = m_evpsCurBucket.load(std::memory_order_relaxed);
+    int64_t bStart  = m_evpsBuckets[cur].startMs.load(std::memory_order_relaxed);
+
+    if (bStart < 0 || nowMs - bStart >= 10) {
+        int next = (cur + 1) % kEvpsBuckets;
+        m_evpsBuckets[next].startMs.store(nowMs, std::memory_order_relaxed);
+        m_evpsBuckets[next].count.store(count,  std::memory_order_relaxed);
+        m_evpsCurBucket.store(next,            std::memory_order_relaxed);
+    } else {
+        m_evpsBuckets[cur].count.fetch_add(count,  std::memory_order_relaxed);
+    }
+}
+
+uint64_t MidiOutputEngine::GetEventsPerSecond() const {
+    auto    now   = std::chrono::steady_clock::now();
+    int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count();
+                        
+    // If queried within 10ms, return the cached result.
+    // This prevents redundant bucket loops when running at high uncapped FPS.
+    int64_t lastUpdate = m_lastEpsUpdateMs.load(std::memory_order_relaxed);
+    if (nowMs - lastUpdate < 10) {
+        return m_cachedEps.load(std::memory_order_relaxed);
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < kEvpsBuckets; i++) {
+        int64_t start = m_evpsBuckets[i].startMs.load(std::memory_order_relaxed);
+        if (start >= 0 && nowMs - start <= 1000)
+            total += m_evpsBuckets[i].count.load(std::memory_order_relaxed);
+    }
+
+    m_cachedEps.store(total, std::memory_order_relaxed);
+    m_lastEpsUpdateMs.store(nowMs, std::memory_order_relaxed);
+    return total;
+}
+
 void MidiOutputEngine::PlaybackThread() {
     while (threadRunning) {
         if (isPaused || isFinished) {
@@ -399,39 +491,36 @@ void MidiOutputEngine::PlaybackThread() {
         uint64_t elapsedRealMicros = std::chrono::duration_cast<std::chrono::microseconds>(now - playbackStartTime).count();
         uint64_t elapsedVirtualMicros = (uint64_t)(elapsedRealMicros * playbackSpeed.load());
         
-		double microsSinceLastEvent = ((double)elapsedVirtualMicros > accumulatedMicroseconds)
-			? (double)elapsedVirtualMicros - accumulatedMicroseconds : 0.0;
-		double effectiveMicrosPerTick = microsecondsPerTick;
-		const int64_t eps = simulateEventsPerSecond.load();
-		if (eps > 0 && simLagActive.load() && !simLagSmooth.load()) {
-			microsSinceLastEvent = 0.0; 
-		}
-		
+        double microsSinceLastEvent = ((double)elapsedVirtualMicros > accumulatedMicroseconds)
+            ? (double)elapsedVirtualMicros - accumulatedMicroseconds : 0.0;
+        double effectiveMicrosPerTick = microsecondsPerTick;
+        const int64_t eps = simulateEventsPerSecond.load();
+        if (eps > 0 && simLagActive.load() && !simLagSmooth.load()) {
+            microsSinceLastEvent = 0.0; 
+        }
+        
         if (effectiveMicrosPerTick > 0.0) {
             uint64_t rawVizTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / effectiveMicrosPerTick);
-            // Cap at B so the visualiser never shows ticks past the loop-end point
-            // and so the realtime-tick check below cannot falsely trigger early loop-back.
             if (hasLoopPoints.load() && isLooping.load())
                 currentVisualizerTick = std::min(rawVizTick, loopEndTick.load());
             else
                 currentVisualizerTick = rawVizTick;
         }
 
-        // ── Token-bucket refill ───────────────────────────────────────────────
         if (eps > 0) {
             auto nowSim = std::chrono::steady_clock::now();
             double dt = std::chrono::duration<double>(nowSim - simLastRefill).count();
             simLastRefill = nowSim;
-            const double burstCap = (double)eps * 0.002; // 2 ms burst window
+            const double burstCap = (double)eps * 0.002; 
             simTokens = std::min(simTokens + dt * (double)eps, burstCap);
         }
 
         int processedInBatch = 0;
+        uint64_t dispatchAccumulator = 0; // Local counter for batching metrics
 
         while (eventPos < eventList->size() && threadRunning && !isPaused) {
             const auto& event = (*eventList)[eventPos];
 
-            // ── A/B loop end gate: stop processing events at or past loopEndTick ──
             if (hasLoopPoints.load() && isLooping.load()) {
                 if ((uint64_t)event.tick >= loopEndTick.load()) break;
             }
@@ -439,15 +528,16 @@ void MidiOutputEngine::PlaybackThread() {
             double scheduledTime = accumulatedMicroseconds + (event.tick - lastProcessedTick) * effectiveMicrosPerTick;    
             if (scheduledTime > (double)elapsedVirtualMicros) {
                 double waitTimeMicros = scheduledTime - (double)elapsedVirtualMicros;
-                if (waitTimeMicros > 2000.0) {
+                if (waitTimeMicros > 2500.0) {
                     uint64_t sleepTime = (uint64_t)(waitTimeMicros - 1500.0);
-                    if (sleepTime > 2000) sleepTime = 2000; 
+                    if (sleepTime > 5000) sleepTime = 5000; 
                     std::this_thread::sleep_for(std::chrono::microseconds(sleepTime));
+                } else if (waitTimeMicros > 200.0) {
+                    std::this_thread::yield();
                 }
                 break; 
             }
 
-            // ── Lag Simulator gate ────────────────────────────────────────────
             const bool bassActive = g_BassEngine.IsInitialized() &&
                                     g_BassEngine.GetActiveMode() != AudioMode::KDMAPI;
             if (eps > 0 && !bassActive) {
@@ -458,7 +548,7 @@ void MidiOutputEngine::PlaybackThread() {
                 simTokens -= 1.0;
                 simLagActive.store(false);
             }
-			
+            
             accumulatedMicroseconds = scheduledTime;
             lastProcessedTick = event.tick;
             processedInBatch++;
@@ -468,62 +558,66 @@ void MidiOutputEngine::PlaybackThread() {
             }
             
             if (event.type == (uint8_t)EventType::TEMPO) {
-                currentTempo = event.data.tempo;
+                currentTempo = event.getTempo();
                 microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, currentPpq);
                 effectiveMicrosPerTick = microsecondsPerTick;
             } else if (event.type == (uint8_t)EventType::NOTE_OFF) {
-                // Completely pure, unaltered Note-Off stream for OmniMIDI reference counting!
-				DispatchMidiOut((0x80 | event.channel) | (event.data.note.n << 8) | (event.data.note.v << 16));
-				activeNotes[event.channel][event.data.note.n] = false;
-			} else if (event.type == (uint8_t)EventType::NOTE_ON) {
-				uint8_t ch = event.channel, n = event.data.note.n, v = event.data.note.v;
-                // Completely pure, unaltered Note-On stream!
+                DispatchMidiOut((0x80 | event.channel) | (event.getNote() << 8) | (event.getVelocity() << 16));
+                activeNotes[event.channel][event.getNote()] = false;
+            } else if (event.type == (uint8_t)EventType::NOTE_ON) {
+                uint8_t ch = event.channel, n = event.getNote(), v = event.getVelocity();
                 DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
                 activeNotes[ch][n] = (v > 0);
-			} else if (event.type == (uint8_t)EventType::CC) {
-                DispatchMidiOut((0xB0 | event.channel) | (event.data.cc.c << 8) | (event.data.cc.v << 16));
+            } else if (event.type == (uint8_t)EventType::CC) {
+                DispatchMidiOut((0xB0 | event.channel) | (event.getCCController() << 8) | (event.getCCValue() << 16));
             } else if (event.type == (uint8_t)EventType::PITCH_BEND) {
-                DispatchMidiOut((0xE0 | event.channel) | (event.data.raw.l1 << 8) | (event.data.raw.m2 << 16));
+                DispatchMidiOut((0xE0 | event.channel) | (event.getPitchBendLSB() << 8) | (event.getPitchBendMSB() << 16));
             } else if (event.type == (uint8_t)EventType::PROGRAM_CHANGE) {
-                DispatchMidiOut((0xC0 | event.channel) | (event.data.val << 8));
+                DispatchMidiOut((0xC0 | event.channel) | (event.getValue() << 8));
             }
-            eventPos++;
+
+			// eventPos must ALWAYS advance — this is the playback loop's own
+			// read cursor, not a debug counter. Gating it behind the
+			// info-only "event counter record" toggle would freeze playback
+			// entirely (this exact index never advances) whenever that
+			// toggle is off. Only the EVPS/dispatch stats accumulation is
+			// optional; advancement is not.
+			eventPos++;
+			if (eventCounterRecordEnabled.load(std::memory_order_relaxed)) {
+				dispatchAccumulator++; // Increment the local batch counter
+				if (dispatchAccumulator >= 2048) {
+					RecordDispatch(dispatchAccumulator);
+					dispatchAccumulator = 0;
+				}
+			}
+        }
+
+        // Flush any remaining accumulated dispatches at the end of the batch
+        if (dispatchAccumulator > 0) {
+            RecordDispatch(dispatchAccumulator);
+            dispatchAccumulator = 0;
         }
 
         if (eps > 0 && simLagActive.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // ── A/B loop-back ─────────────────────────────────────────────────────
-        // Only fires when:
-        //   (a) every event before B has been dispatched (inner loop stopped at B gate), AND
-        //   (b) the virtual clock has actually reached B's scheduled microsecond position.
-        // Without (b), the last events near B would already be sent but the loop-back
-        // would happen before their scheduled time, causing audible gaps or jumps.
         if (hasLoopPoints.load() && isLooping.load() && threadRunning && !isPaused) {
             uint64_t loopEnd = loopEndTick.load();
 
-            // Condition (a): the next event to process is at or past B (or song ended)
             bool nextPastB = (eventPos >= eventList->size()) ||
                              ((uint64_t)(*eventList)[eventPos].tick >= loopEnd);
 
             if (nextPastB) {
-                // Condition (b): compute virtual micros at exactly tick B
-                // accumulatedMicroseconds + delta_ticks * mpt  (using current tempo)
                 double loopEndMicros = accumulatedMicroseconds +
                     (double)((int64_t)loopEnd - (int64_t)lastProcessedTick) * effectiveMicrosPerTick;
 
                 if ((double)elapsedVirtualMicros >= loopEndMicros) {
-                    // Virtual clock has reached B — loop back to A now
                     LoopBackToTick(loopStartTick.load());
                     continue;
                 }
 
-                // Not time yet: sleep proportionally so we wake up right at B.
-                // Convert virtual-time remainder to real-time remainder.
-                double realWaitUs = (loopEndMicros - (double)elapsedVirtualMicros)
-                                    / std::max(0.01, (double)playbackSpeed.load());
-                // Sleep conservatively — subtract 400 µs margin for wakeup overhead
+                double realWaitUs = (loopEndMicros - (double)elapsedVirtualMicros) / std::max(0.01, (double)playbackSpeed.load());
                 if (realWaitUs > 800.0) {
                     uint64_t sleepUs = std::min((uint64_t)(realWaitUs - 400.0), (uint64_t)2000);
                     std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
@@ -534,11 +628,8 @@ void MidiOutputEngine::PlaybackThread() {
         if (eventPos >= eventList->size()) {
             if (isLooping.load()) {
                 if (hasLoopPoints.load()) {
-                    // A/B loop: seek back to A point
                     LoopBackToTick(loopStartTick.load());
-                    // continue so outer loop re-reads the new clock
                 } else {
-                    // Full-song loop (original behaviour: restart from tick 0)
                     SilenceAllChannels();
                     accumulatedMicroseconds = 0.0;
                     lastProcessedTick = 0;
@@ -547,7 +638,7 @@ void MidiOutputEngine::PlaybackThread() {
 
                     uint32_t tempTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
                     if (!eventList->empty() && (*eventList)[0].type == (uint8_t)EventType::TEMPO)
-                        tempTempo = (*eventList)[0].data.tempo;
+                        tempTempo = (*eventList)[0].getTempo();
                     currentTempo = tempTempo;
                     microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, currentPpq);
 

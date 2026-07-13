@@ -150,32 +150,42 @@ struct TempoEvent {
 
 // ===== UNIFIED MIDI EVENT STRUCTURE =====
 enum class EventType : uint8_t { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
-enum class ViewerType : uint8_t { ChannelTrackLayer, TickLayer };
+enum class ViewerType : uint8_t { TrackLayer, TickLayer };
 enum class InputMode : uint8_t { Normal, Simulate };
 
-// MidiEvent: 12 bytes.
-// Layout: tick(4) + type(1) + channel(1) + _pad(2) + data(4) = 12B
-// Field order is IDENTICAL to the original — do NOT reorder.
-// midioutput.hpp and any other TU that uses MidiEvent by raw offset must
-// see exactly this layout. The _pad field just makes the compiler-inserted
-// padding explicit; it does not change sizeof or any field offset.
 struct MidiEvent {
-    uint32_t tick;      // offset 0 (4B)
-    uint8_t  type;      // offset 4 (1B)
-    uint8_t  channel;   // offset 5 (1B)
-    uint16_t _pad{0};   // offset 6 (2B) — explicit; was implicit compiler padding before
-    union {             // offset 8 (4B)
-        struct { uint8_t n; uint8_t v; } note;  // NOTE_ON / NOTE_OFF
-        struct { uint8_t c; uint8_t v; } cc;    // CC
-        struct { uint8_t l1; uint8_t m2; } raw; // PITCH_BEND (LSB, MSB)
-        uint8_t  val;                           // PROGRAM_CHANGE / CHANNEL_PRESSURE
-        uint32_t tempo;                         // TEMPO (24-bit value in low 3 bytes)
-    } data;
+    uint32_t tick;          // Offset 0 (4 Bytes)
+    uint32_t data : 24;     // Offset 4 (3 Bytes) - Note/CC/PitchBend/Tempo
+    uint32_t channel : 4;   // Offset 7 (4 bits)  - MIDI Channel (0-15)
+    uint32_t type : 4;      // Offset 7 (4 bits)  - EventType enum value
 
     MidiEvent(uint32_t t, EventType et, uint8_t ch)
-        : tick(t), type((uint8_t)et), channel(ch), _pad(0) {
-        memset(&data, 0, sizeof(data));
+        : tick(t), data(0), channel(ch), type(static_cast<uint32_t>(et)) {}
+
+    // Inline helpers to keep the rest of the codebase clean
+    inline uint8_t getNote() const { return data & 0xFF; }
+    inline uint8_t getVelocity() const { return (data >> 8) & 0xFF; }
+    inline void setNote(uint8_t note, uint8_t vel) {
+        data = note | (vel << 8);
     }
+
+    inline uint8_t getCCController() const { return data & 0xFF; }
+    inline uint8_t getCCValue() const { return (data >> 8) & 0xFF; }
+    inline void setCC(uint8_t ctrl, uint8_t val) {
+        data = ctrl | (val << 8);
+    }
+
+    inline uint8_t getPitchBendLSB() const { return data & 0xFF; }
+    inline uint8_t getPitchBendMSB() const { return (data >> 8) & 0xFF; }
+    inline void setPitchBend(uint8_t lsb, uint8_t msb) {
+        data = lsb | (msb << 8);
+    }
+
+    inline uint8_t getValue() const { return data & 0xFF; }
+    inline void setValue(uint8_t val) { data = val; }
+
+    inline uint32_t getTempo() const { return data; }
+    inline void setTempo(uint32_t tempo) { data = tempo & 0xFFFFFF; }
 
     bool operator<(const MidiEvent& other) const {
         if (tick != other.tick) return tick < other.tick;
@@ -183,16 +193,16 @@ struct MidiEvent {
     }
 };
 
+// Compile-time verification that there is absolutely no padding
+static_assert(sizeof(MidiEvent) == 8, "MidiEvent must be exactly 8 bytes!");
+
 // ===== load.cpp — streaming MIDI parser (1:1 memory, uint24 tempo) =====
 std::vector<CCEvent> loadStreamingMidiData(
-    const std::string&              filename,
-    std::vector<OptimizedTrackData>& tracks,
-    int&                            ppq,
-    int&                            initialTempo,
-    uint64_t&                       totalNoteCount,
-    uint16_t&                       outTimeSigNumerator,    // filled from meta 0x58; default 4
-    uint16_t&                       outTimeSigDenominator,  // filled from meta 0x58; default 4
-    LoadProgress*                   progress = nullptr);
+    const std::string& filename, std::vector<OptimizedTrackData>& tracks,
+    int& ppq, int& initialTempo, uint64_t& totalNoteCount,
+    uint16_t& outTimeSigNumerator, uint16_t& outTimeSigDenominator,
+    LoadProgress* progress,
+    bool removeOverlaps); 
 
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 
@@ -203,7 +213,7 @@ const std::vector<MidiEvent>& GetGlobalMidiEvents();
 // ===================================================================
 // GLOBAL CONFIGURATION SETTINGS (Placed at bottom to resolve types)
 // ===================================================================
-enum class BgImageFit : int { Stretch = 0, Fit, Fill, Center };
+enum class BgImageFit : uint8_t { Stretch = 0, Fit, Fill, Center };
 
 extern bool showGuide;
 extern bool showBeats;

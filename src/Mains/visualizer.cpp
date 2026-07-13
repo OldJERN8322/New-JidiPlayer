@@ -90,6 +90,7 @@ bool showBeats = true; // Toggle for beats
 bool showDebug = false; // Toggle for debug
 bool showPerformance = false; // Toggle for Performance
 bool showOptions = false;
+bool g_enableOverlapRemove = false; // Toggle for render overlap removal
 ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
 static bool firstPause = true; // Loads do first pause (kept static since it is only used here)
 static AppState currentState = STATE_MENU;
@@ -97,7 +98,8 @@ static std::string selectedMidiFile = "Empty";
 float ScrollSpeed = 0.5f;
 float MidiSpeed = 1.00f;
 int cursorPos = 0;
-uint64_t renderNotes = 0, maxRenderNotes = 0;
+std::atomic<uint64_t> renderNotes{0};
+std::atomic<uint64_t> maxRenderNotes{0};
 bool isHUD = true;
 
 // Custom background color (RGBA, normalized [0,1] for ImGui; converted to raylib Color on use)
@@ -189,12 +191,12 @@ static uint64_t g_currentPoly = 0;    // polyphony at current tick
 static uint64_t g_maxPoly     = 0;    // peak polyphony seen so far this file
 
 // ===================================================================
-// CHUNK SLIDING-WINDOW RENDERER variables (Replace your existing ones)
+// CHUNK SLIDING-WINDOW RENDERER variables (Synchronized & Thread-Safe)
 // ===================================================================
 
 static std::atomic<bool>  g_seekInvalidate{ false };
 static constexpr int      PIX_H     = 128;
-static constexpr int      N_CHUNKS  = 4;   // 1 current + 3 ahead (matches diagram)
+static constexpr int      N_CHUNKS  = 4;   // 1 current + 3 ahead
 
 static Texture2D             g_tex        = { 0 };
 static int                   g_texW       = 0;   // = N_CHUNKS * screenWidth
@@ -203,41 +205,60 @@ static double                g_pixPerTick = 0.0;
 static uint32_t              g_bufOriginTick = 0;  // tick at pixel col 0
 static std::vector<uint32_t> g_pixBuf;             // [PIX_H rows][g_texW cols]
 
-// Which chunks have been painted (by the bg thread or on seek)
-// g_chunkPainted[c] = true means chunk c is valid for the current g_bufOriginTick
 static bool     g_chunkPainted[N_CHUNKS]    = {};
 static uint32_t g_chunkOriginTick[N_CHUNKS] = {};  
 
-// Background thread paints one chunk at a time
+// Background thread paints one chunk at a time using immutable bounds
+struct ChunkJob { 
+    int chunkIdx; 
+    uint32_t tickStart; 
+    uint32_t tickEnd; 
+};
+
 static std::thread              g_paintThread;
 static std::atomic<bool>        g_paintStop{ false };
 static std::mutex               g_paintMtx;
 static std::condition_variable  g_paintCV;
-struct ChunkJob { int chunkIdx; uint32_t tickStart; }; // ONLY DECLARE THIS ONCE!
 static std::queue<ChunkJob>     g_paintQueue;
 static std::atomic<int>         g_lastPaintedChunk{ -1 };
 
-// Track data (read-only after load, shared with bg thread safely)
+// Guards raw g_pixBuf memory itself (writes from the background paint
+// thread vs. reads from the main thread when uploading to the GPU texture).
+// g_paintMtx above only protects the job queue, NOT the pixel data, so it
+// is not sufficient on its own to prevent a torn read of g_pixBuf.
+static std::mutex               g_pixBufMtx;
+
 static const std::vector<OptimizedTrackData>* g_tracks      = nullptr;
-static ViewerType                              g_bgViewerType = ViewerType::ChannelTrackLayer;
+static ViewerType                              g_bgViewerType = ViewerType::TrackLayer;
 
 static bool     g_rtNeedsFullRedraw = true;
-static uint32_t g_ticksPerChunk     = 0;  // ticks that fit in one chunk width (integer approx)
-static double   g_ticksPerChunkExact = 0.0; // exact double: chunkW / ppt
+static uint32_t g_ticksPerChunk     = 0;  
+static double   g_ticksPerChunkExact = 0.0; 
 
-// Compute exact chunkOriginTick for chunk c given a buffer origin tick.
 static inline uint32_t ExactChunkOrigin(uint32_t bufOrigin, int c) {
     return bufOrigin + (uint32_t)std::round((double)c * g_ticksPerChunkExact);
 }
+
+// Contiguous chunk boundaries helper functions
+static inline uint32_t GetChunkStartTick(int c, uint32_t bufOrigin, uint64_t windowOffset) {
+    return ExactChunkOrigin(bufOrigin, windowOffset + c);
+}
+
+static inline uint32_t GetChunkEndTick(int c, uint32_t bufOrigin, uint64_t windowOffset) {
+    if (c < N_CHUNKS - 1) {
+        return ExactChunkOrigin(bufOrigin, windowOffset + c + 1);
+    }
+    return ExactChunkOrigin(bufOrigin, windowOffset + c) + g_ticksPerChunk;
+}
+
+static std::atomic<bool> g_paintBusy{ false };
+static std::atomic<bool> g_paintCancel{ false };
 
 // ---- helpers ---------------------------------------------------------------
 static inline uint32_t ToRGBA8(Color c) {
     return (uint32_t)c.r | ((uint32_t)c.g << 8) | ((uint32_t)c.b << 16) | (0xFFu << 24);
 }
 inline Color GetTrackColorPFA(int track, int channel);
-
-static std::atomic<bool> g_paintBusy{ false };
-static std::atomic<bool> g_paintCancel{ false };
 
 // ===================================================================
 // FIX: Sliding Window Smooth Scroll & TickLayer Tracking Colors
@@ -247,6 +268,37 @@ static std::atomic<bool> g_paintCancel{ false };
 
 static uint64_t g_windowOffsetChunks = 0;
 
+struct RowSpan {
+    int x0, x1;
+    uint32_t rgba;
+};
+
+// ===================================================================
+// SEAMLESS CONTIGUOUS RENDERING & LOD OCCLUSION RASTERIZER
+// ===================================================================
+
+struct ReverseCursor {
+    std::vector<NoteEvent>::const_iterator cur;
+    std::vector<NoteEvent>::const_iterator begin;
+    size_t trackIdx;
+
+    // For max-heap (largest startTick at the top)
+    bool operator<(const ReverseCursor& other) const {
+        return cur->startTick < other.cur->startTick;
+    }
+};
+
+struct ForwardCursor {
+    std::vector<NoteEvent>::const_iterator cur;
+    std::vector<NoteEvent>::const_iterator end;
+    size_t trackIdx;
+
+    // For min-heap (smallest startTick at the top)
+    bool operator<(const ForwardCursor& other) const {
+        return cur->startTick > other.cur->startTick; // Inverted for min-heap
+    }
+};
+
 static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
 {
     if (!g_tracks || g_texW == 0 || tickEnd <= tickStart) return;
@@ -254,150 +306,246 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
     const int    base = chunkIdx * W;
     const double ppt  = g_pixPerTick;
 
-    // Clear chunk
+    // 1. Clear chunk memory segment
     for (int y = 0; y < PIX_H; ++y)
         std::memset(&g_pixBuf[(size_t)y * g_texW + base], 0, (size_t)W * sizeof(uint32_t));
 
+    // 2. Pre-allocate flat rows (thread-local to avoid runtime reallocation)
+    thread_local std::vector<uint32_t> rowColors[128];
+    for (int y = 0; y < 128; ++y) {
+        rowColors[y].assign(W, 0u);
+    }
+
     uint64_t count = 0;
+    int cancelCheckCounter = 0;
 
     if (g_bgViewerType == ViewerType::TickLayer) {
-        struct NoteRef {
-            const NoteEvent* note;
-            uint16_t trackIdx;
-        };
-        
-        thread_local std::vector<NoteRef> chunkNotes;
-        chunkNotes.clear();
-        
-        if (chunkNotes.capacity() < 2000000) chunkNotes.reserve(2000000); 
+        if (g_enableOverlapRemove) {
+            // ---- TICK LAYER (Overlap Remove Enabled): Heap-Optimized Reverse K-Way Merge ----
+            thread_local std::vector<ReverseCursor> heap;
+            heap.clear();
 
+            for (size_t t = 0; t < g_tracks->size(); ++t) {
+                const auto& track = (*g_tracks)[t];
+                if (track.notes.empty()) continue;
+
+                auto ri_start = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+                    [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+                auto ri = ri_start;
+                int backLimit = 0;
+                while (ri != track.notes.begin() && backLimit < 2000) {
+                    --ri; backLimit++;
+                    if (ri->endTick <= tickStart) { ++ri; break; }
+                }
+                ri_start = ri;
+
+                auto ri_end = std::lower_bound(ri_start, track.notes.end(), tickEnd,
+                    [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+                if (ri_start != ri_end) {
+                    heap.push_back({ ri_end - 1, ri_start, t });
+                }
+            }
+
+            std::make_heap(heap.begin(), heap.end());
+
+            while (!heap.empty()) {
+                if (++cancelCheckCounter % 8192 == 0) {
+                    if (g_paintCancel.load(std::memory_order_relaxed)) return;
+                }
+
+                // Extract track cursor with the largest startTick
+                std::pop_heap(heap.begin(), heap.end());
+                ReverseCursor top = heap.back();
+                heap.pop_back();
+
+                const NoteEvent& n = *top.cur;
+                size_t t = top.trackIdx;
+
+                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+
+                if (ds < de) {
+                    int px0 = (int)((double)(ds - tickStart) * ppt);
+                    int px1 = (int)((double)(de - tickStart) * ppt);
+                    if (px1 > px0 + 1) px1--;
+                    if (px0 < 0)  px0 = 0;
+                    if (px1 > W)  px1 = W;
+
+                    if (px0 < px1) {
+                        int y = (PIX_H - 1) - (int)n.note;
+                        if ((unsigned)y < (unsigned)PIX_H) {
+                            Color col = GetTrackColorPFA((int)t, n.channel);
+                            uint32_t rgba = ToRGBA8(col);
+
+                            // Reverse Occlusion: write only if pixel is empty
+                            for (int px = px0; px < px1; ++px) {
+                                if (rowColors[y][px] == 0) {
+                                    rowColors[y][px] = rgba;
+                                }
+                            }
+                            count++;
+                        }
+                    }
+                }
+
+                if (top.cur != top.begin) {
+                    top.cur--;
+                    heap.push_back(top);
+                    std::push_heap(heap.begin(), heap.end());
+                }
+            }
+        }
+        else {
+            // ---- TICK LAYER (Overlap Remove Disabled): Heap-Optimized Forward K-Way Merge ----
+            thread_local std::vector<ForwardCursor> heapF;
+            heapF.clear();
+
+            for (size_t t = 0; t < g_tracks->size(); ++t) {
+                const auto& track = (*g_tracks)[t];
+                if (track.notes.empty()) continue;
+
+                auto ri_start = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+                    [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+                auto ri = ri_start;
+                int backLimit = 0;
+                while (ri != track.notes.begin() && backLimit < 2000) {
+                    --ri; backLimit++;
+                    if (ri->endTick <= tickStart) { ++ri; break; }
+                }
+                ri_start = ri;
+
+                auto ri_end = std::lower_bound(ri_start, track.notes.end(), tickEnd,
+                    [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
+
+                if (ri_start != ri_end) {
+                    heapF.push_back({ ri_start, ri_end, t });
+                }
+            }
+
+            std::make_heap(heapF.begin(), heapF.end());
+
+            while (!heapF.empty()) {
+                if (++cancelCheckCounter % 8192 == 0) {
+                    if (g_paintCancel.load(std::memory_order_relaxed)) return;
+                }
+
+                // Extract track cursor with the smallest startTick
+                std::pop_heap(heapF.begin(), heapF.end());
+                ForwardCursor top = heapF.back();
+                heapF.pop_back();
+
+                const NoteEvent& n = *top.cur;
+                size_t t = top.trackIdx;
+
+                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+
+                if (ds < de) {
+                    int px0 = (int)((double)(ds - tickStart) * ppt);
+                    int px1 = (int)((double)(de - tickStart) * ppt);
+                    if (px1 > px0 + 1) px1--;
+                    if (px0 < 0)  px0 = 0;
+                    if (px1 > W)  px1 = W;
+
+                    if (px0 < px1) {
+                        int y = (PIX_H - 1) - (int)n.note;
+                        if ((unsigned)y < (unsigned)PIX_H) {
+                            Color col = GetTrackColorPFA((int)t, n.channel);
+                            uint32_t rgba = ToRGBA8(col);
+
+                            std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
+                            count++;
+                        }
+                    }
+                }
+
+                top.cur++;
+                if (top.cur != top.end) {
+                    heapF.push_back(top);
+                    std::push_heap(heapF.begin(), heapF.end());
+                }
+            }
+        }
+    }
+    else {
+        // ---- TRACK LAYER: Track-Priority Layering (Domino Style) ----
         for (size_t t = 0; t < g_tracks->size(); ++t) {
             if (g_paintCancel.load(std::memory_order_relaxed)) return;
             const auto& track = (*g_tracks)[t];
             if (track.notes.empty()) continue;
 
-            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+            auto ri_start = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
                 [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
 
-            auto ri = it;
-            while (ri != track.notes.begin()) {
-                --ri;
+            auto ri = ri_start;
+            int backLimit = 0;
+            while (ri != track.notes.begin() && backLimit < 2000) {
+                --ri; backLimit++;
                 if (ri->endTick <= tickStart) { ++ri; break; }
             }
+            ri_start = ri;
 
-            for (; ri != track.notes.end() && ri->startTick < tickEnd; ++ri) {
-                const NoteEvent& n = *ri;
-                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
-                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
-                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
-                if (ds >= de) continue;
-
-                int px0 = (int)((double)(ds - tickStart) * ppt);
-                int px1 = (int)((double)(de - tickStart) * ppt) + 1;
-                if (px0 < 0)  px0 = 0;
-                if (px1 > W)  px1 = W;
-                if (px0 >= px1) continue;
-
-                int y = (PIX_H - 1) - (int)n.note;
-                if ((unsigned)y >= (unsigned)PIX_H) continue;
-
-                chunkNotes.push_back({&n, (uint16_t)t});
-            }
-        }
-
-        // Lux's fix: merge all tracks into one array, sort by startTick ascending,
-        // then draw in REVERSE (latest tick first = background, earliest tick last = foreground).
-        // "First note played = on top" — matches PFA layering behavior exactly.
-        // if (row[px] == 0) guard means first writer wins = earliest tick wins each pixel.
-        std::sort(chunkNotes.begin(), chunkNotes.end(), [](const NoteRef& a, const NoteRef& b){
-            if (a.note->startTick != b.note->startTick) return a.note->startTick < b.note->startTick;
-            return a.trackIdx < b.trackIdx; // same tick: track 0 drawn last = on top
-        });
-
-        for (int i = (int)chunkNotes.size() - 1; i >= 0; --i) {
-            if (g_paintCancel.load(std::memory_order_relaxed)) return;
-            const auto& ref = chunkNotes[i];
-            const NoteEvent& n = *ref.note;
-            uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
-            uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
-            uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
-            if (ds >= de) continue;
-
-            int px0 = (int)((double)(ds - tickStart) * ppt);
-            int px1 = (int)((double)(de - tickStart) * ppt) + 1;
-            if (px0 < 0)  px0 = 0;
-            if (px1 > W)  px1 = W;
-            if (px0 >= px1) continue;
-
-            int y = (PIX_H - 1) - (int)n.note;
-            if ((unsigned)y >= (unsigned)PIX_H) continue;
-
-            Color col = GetTrackColorPFA(ref.trackIdx, n.channel);
-            uint32_t rgba = ToRGBA8(col);
-            uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW + base;
-            
-            ++count;
-            for (int px = px0; px < px1; ++px) {
-                if (row[px] == 0) row[px] = rgba;
-            }
-        }
-    } else {
-        // Exact duplicate culling is safe here: ChannelTrackLayer draws directly
-        // in reverse order (track N-1 first), so the sort order is already correct.
-        struct LastNote { int px0; int px1; uint8_t channel; };
-
-        for (int t = (int)g_tracks->size() - 1; t >= 0; --t) {
-            if (g_paintCancel.load(std::memory_order_relaxed)) return;
-            const auto& track = (*g_tracks)[t];
-            if (track.notes.empty()) continue;
-
-            auto it = std::lower_bound(track.notes.begin(), track.notes.end(), tickStart,
+            auto ri_end = std::lower_bound(ri_start, track.notes.end(), tickEnd,
                 [](const NoteEvent& n, uint32_t v){ return n.startTick < v; });
 
-            auto ri_start = it;
-            while (ri_start != track.notes.begin()) {
-                --ri_start;
-                if (ri_start->endTick <= tickStart) { ++ri_start; break; }
-            }
-            
-            auto ri_end = ri_start;
-            while (ri_end != track.notes.end() && ri_end->startTick < tickEnd) {
-                ++ri_end;
-            }
+            for (auto it = ri_start; it != ri_end; ++it) {
+                if (++cancelCheckCounter % 8192 == 0) {
+                    if (g_paintCancel.load(std::memory_order_relaxed)) return;
+                }
 
-            if (ri_start == ri_end) continue;
-
-            auto ri = ri_end;
-            do {
-                --ri;
-                const NoteEvent& n = *ri;
+                const NoteEvent& n = *it;
                 uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
                 uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
                 uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
                 if (ds >= de) continue;
 
                 int px0 = (int)((double)(ds - tickStart) * ppt);
-                int px1 = (int)((double)(de - tickStart) * ppt) + 1;
+                int px1 = (int)((double)(de - tickStart) * ppt);
+                if (px1 > px0 + 1) px1--;
                 if (px0 < 0)  px0 = 0;
                 if (px1 > W)  px1 = W;
                 if (px0 >= px1) continue;
 
                 int y = (PIX_H - 1) - (int)n.note;
                 if ((unsigned)y >= (unsigned)PIX_H) continue;
-                Color col = GetTrackColorPFA((int)t, n.channel);
+
+                Color col = GetTrackColorPFA((int)t, 0); 
                 uint32_t rgba = ToRGBA8(col);
-                uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW + base;
-                
-                ++count;
-				for (int px = px0; px < px1; ++px) {
-					if (row[px] == 0) row[px] = rgba; // already-painted pixel = skip, not black hole
-				}
-            } while (ri != ri_start);
+
+                std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
+                count++;
+            }
         }
     }
 
-    renderNotes = count;
-    maxRenderNotes = std::max(maxRenderNotes, (uint64_t)count);
+    // 3. Thread-safe copy to active global pixel buffer
+    {
+        std::lock_guard<std::mutex> lk(g_pixBufMtx);
+        for (int y = 0; y < PIX_H; ++y) {
+            uint32_t* dst = g_pixBuf.data() + (size_t)y * g_texW + base;
+            std::memcpy(dst, rowColors[y].data(), W * sizeof(uint32_t));
+        }
+    }
+
+    // 4. Thread-safe update of atomic counters
+    renderNotes.store(count, std::memory_order_relaxed);
+    uint64_t currentMax = maxRenderNotes.load(std::memory_order_relaxed);
+    while (count > currentMax && !maxRenderNotes.compare_exchange_weak(currentMax, count, std::memory_order_relaxed));
+}
+
+static void EnqueueChunk(int chunkIdx, uint32_t tickStart, uint32_t tickEnd, bool clearQueue = false)
+{
+    std::lock_guard<std::mutex> lk(g_paintMtx);
+    if (clearQueue) {
+        while (!g_paintQueue.empty()) g_paintQueue.pop();
+    }
+    g_paintQueue.push({ chunkIdx, tickStart, tickEnd });
+    g_paintCV.notify_one();
 }
 
 static void BgPaintThreadFunc()
@@ -411,16 +559,12 @@ static void BgPaintThreadFunc()
             job = g_paintQueue.front();
             g_paintQueue.pop();
         }
-        // Set busy BEFORE clearing cancel so InvalidateNoteBuffer's spin-wait
-        // sees busy=true if we just picked up a job.
+        
         g_paintBusy.store(true, std::memory_order_seq_cst);
         g_paintCancel.store(false, std::memory_order_seq_cst);
 
-        uint32_t te = job.tickStart + g_ticksPerChunk;
-        PaintChunkRange(job.chunkIdx, job.tickStart, te);
+        PaintChunkRange(job.chunkIdx, job.tickStart, job.tickEnd);
 
-        // Only mark as painted if the job wasn't cancelled mid-way.
-        // A cancelled chunk has partial/corrupt data — don't expose it.
         if (!g_paintCancel.load(std::memory_order_acquire)) {
             g_chunkPainted[job.chunkIdx] = true;
             g_lastPaintedChunk.store(job.chunkIdx, std::memory_order_release);
@@ -429,19 +573,8 @@ static void BgPaintThreadFunc()
     }
 }
 
-// Ensure EnqueueChunk can clear the queue optionally
-static void EnqueueChunk(int chunkIdx, uint32_t tickStart, bool clearQueue = false)
-{
-    std::lock_guard<std::mutex> lk(g_paintMtx);
-    if (clearQueue) {
-        while (!g_paintQueue.empty()) g_paintQueue.pop();
-    }
-    g_paintQueue.push({ chunkIdx, tickStart });
-    g_paintCV.notify_one();
-}
-
 // ===================================================================
-// SCROLL VISUALIZER — chunk sliding-window, bg thread, no limits
+// SCROLL VISUALIZER — thread-safe sliding window
 // ===================================================================
 
 void UpdateBuffers(uint64_t currentTick) {}
@@ -487,19 +620,28 @@ void DrawStreamingVisualizerNotes(
     const float  plx = (float)sw * 0.5f;
     const double ppt = (double)(sw - plx) / (double)viewWindow;
 
-    const int newChunkW = sw * 2;
+    // --- Strict Hardware Texture Cap Implementation ---
+    constexpr int MAX_GPU_TEXTURE_WIDTH = 16384;
+    int newChunkW = sw * 2;
+    if (newChunkW * N_CHUNKS > MAX_GPU_TEXTURE_WIDTH) {
+        newChunkW = MAX_GPU_TEXTURE_WIDTH / N_CHUNKS; // Clamps chunk to 4096 px (16384 px total)
+    }
     const int newTexW = N_CHUNKS * newChunkW;
-    const uint64_t newTicksPerChunk = (uint64_t)((double)newChunkW / ppt) + 1;
+
+    // Calculate scale ratio between internal texture width and screen pixel width
+    const float texScale = (float)newChunkW / (float)(sw * 2);
+    const double scaledPpt = ppt * (double)texScale;
+    const uint64_t newTicksPerChunk = (uint64_t)((double)newChunkW / scaledPpt) + 1;
 
     bool changed = (g_tex.id == 0 || g_texW != newTexW ||
-        std::fabs(g_pixPerTick - ppt) > 1e-9);
+        std::fabs(g_pixPerTick - scaledPpt) > 1e-9);
     if (changed) {
         if (g_tex.id != 0) UnloadTexture(g_tex);
         g_chunkW = newChunkW;
         g_texW = newTexW;
-        g_pixPerTick = ppt;
+        g_pixPerTick = scaledPpt;
         g_ticksPerChunk = newTicksPerChunk;
-        g_ticksPerChunkExact = (double)newChunkW / ppt;
+        g_ticksPerChunkExact = (double)newChunkW / scaledPpt;
         g_pixBuf.assign((size_t)newTexW * PIX_H, 0u);
         Image img = {};
         img.data = g_pixBuf.data();
@@ -516,25 +658,24 @@ void DrawStreamingVisualizerNotes(
     g_tracks = &tracks;
     g_bgViewerType = viewerType;
 
-    // Visible tick window
+    // Visible tick window boundaries
     int64_t  sLeft = (int64_t)currentTick - (int64_t)(plx / ppt);
     int64_t  sRight = (int64_t)currentTick + (int64_t)((sw - plx) / ppt) + 1;
     uint64_t leftTick = (uint64_t)std::max((int64_t)0, sLeft);
 
     bool seeked = g_seekInvalidate.exchange(false);
 
-    // ---- On seek or init: FULLY ASYNC QUEUE (No longer blocks Main Thread!) ----
+    // ---- On seek or init: CONTIGUOUS SEAMLESS RENDERING (100% Asynchronous) ----
     if (seeked || g_rtNeedsFullRedraw) {
         g_rtNeedsFullRedraw = false;
 
-        // 1. Clear queue and signal thread to abort
         {
             std::lock_guard<std::mutex> lk(g_paintMtx);
             while (!g_paintQueue.empty()) g_paintQueue.pop();
         }
         g_paintCancel.store(true, std::memory_order_release);
 
-        // 2. Wait for BG thread to finish aborting (PREVENTS DATA RACES & LAG)
+        // Aborts background worker rapidly due to micro-interval cancel checks
         while (g_paintBusy.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
@@ -551,29 +692,27 @@ void DrawStreamingVisualizerNotes(
             else break;
         }
 
-        // 3. Reset cancel flag
         g_paintCancel.store(false, std::memory_order_release);
 
-        // 4. Blackout texture immediately on main thread so we don't show old garbage
         std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
         UpdateTexture(g_tex, g_pixBuf.data());
 
-        // 5. Enqueue all chunks asynchronously! 
-        EnqueueChunk(visibleChunk, g_chunkOriginTick[visibleChunk], false);
-        for (int nc = visibleChunk + 1; nc < N_CHUNKS; ++nc) {
-            EnqueueChunk(nc, g_chunkOriginTick[nc], false);
+        // Enqueue visible and future look-ahead chunks asynchronously
+        for (int nc = visibleChunk; nc < N_CHUNKS; ++nc) {
+            uint32_t cts = GetChunkStartTick(nc, g_bufOriginTick, 0);
+            uint32_t cte = GetChunkEndTick(nc, g_bufOriginTick, 0);
+            EnqueueChunk(nc, cts, cte, false);
         }
     }
     else {
-        // ---- Normal streaming: check if bg thread finished a chunk, upload ----
         int lp = g_lastPaintedChunk.exchange(-1, std::memory_order_acquire);
         if (lp >= 0) {
+            std::lock_guard<std::mutex> lk(g_pixBufMtx);
             UpdateTexture(g_tex, g_pixBuf.data());
         }
 
-        // SLIDING WINDOW SHIFT - Smooth scrolling without panicking!
-        // We shift when chunk 0 is entirely offscreen (leftTick >= chunkOriginTick[1])
-        if (leftTick >= g_chunkOriginTick[1]) {
+        // SLIDING WINDOW SHIFT - Delay shift until the next buffer is fully painted
+        if (leftTick >= g_chunkOriginTick[1] && g_chunkPainted[1]) {
             {
                 std::lock_guard<std::mutex> lk(g_paintMtx);
                 while (!g_paintQueue.empty()) g_paintQueue.pop();
@@ -581,35 +720,33 @@ void DrawStreamingVisualizerNotes(
             g_paintCancel.store(true, std::memory_order_release);
             while (g_paintBusy.load(std::memory_order_acquire)) { std::this_thread::yield(); }
 
-            // Shift pixels mathematically row by row
             for (int y = 0; y < PIX_H; ++y) {
                 uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW;
                 std::memmove(row, row + g_chunkW, (g_texW - g_chunkW) * sizeof(uint32_t));
                 std::memset(row + (g_texW - g_chunkW), 0, g_chunkW * sizeof(uint32_t));
             }
 
-            // Shift chunk metadata tracking
             g_windowOffsetChunks++;
             for (int i = 0; i < N_CHUNKS - 1; ++i) {
                 g_chunkOriginTick[i] = g_chunkOriginTick[i + 1];
                 g_chunkPainted[i] = g_chunkPainted[i + 1];
             }
-            // Prepare new chunk N_CHUNKS-1
             g_chunkOriginTick[N_CHUNKS - 1] = ExactChunkOrigin(g_bufOriginTick, g_windowOffsetChunks + N_CHUNKS - 1);
             g_chunkPainted[N_CHUNKS - 1] = false;
 
             UpdateTexture(g_tex, g_pixBuf.data());
 
-            // Enqueue all unpainted chunks (in case they were cancelled mid-paint)
             g_paintCancel.store(false, std::memory_order_release);
             for (int c = 0; c < N_CHUNKS; ++c) {
                 if (!g_chunkPainted[c]) {
-                    EnqueueChunk(c, g_chunkOriginTick[c], false);
+                    uint32_t ts = GetChunkStartTick(c, g_bufOriginTick, g_windowOffsetChunks);
+                    uint32_t te = GetChunkEndTick(c, g_bufOriginTick, g_windowOffsetChunks);
+                    EnqueueChunk(c, ts, te, false);
                 }
             }
         }
-        else {
-            // Panic reset - If view scrolled deeply beyond buffer fast (or backwards past chunk 0)
+        else if (leftTick < g_chunkOriginTick[1]) {
+            // Panic Reset
             uint64_t bufEnd = g_chunkOriginTick[N_CHUNKS - 1] + g_ticksPerChunk;
             bool fellBehind = (leftTick < g_chunkOriginTick[0]) || ((uint64_t)sRight > bufEnd);
             if (fellBehind) {
@@ -634,13 +771,13 @@ void DrawStreamingVisualizerNotes(
 
                 g_paintCancel.store(false, std::memory_order_release);
                 
-                // PREVENT JUMPSCARE (wipe screen cleanly instead of jumping old buffer)
                 std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
                 UpdateTexture(g_tex, g_pixBuf.data());
 
-                EnqueueChunk(vc, g_chunkOriginTick[vc], false);
-                for (int nc = vc + 1; nc < N_CHUNKS; ++nc) {
-                    EnqueueChunk(nc, g_chunkOriginTick[nc], false);
+                for (int nc = vc; nc < N_CHUNKS; ++nc) {
+                    uint32_t ts = GetChunkStartTick(nc, g_bufOriginTick, 0);
+                    uint32_t te = GetChunkEndTick(nc, g_bufOriginTick, 0);
+                    EnqueueChunk(nc, ts, te, false);
                 }
             }
         }
@@ -654,45 +791,62 @@ void DrawStreamingVisualizerNotes(
             int64_t viewLeftTick = (sLeft >= 0) ? sLeft : 0;
             int64_t viewRightTick = sRight;
 
-            // Find which chunk viewLeftTick falls in
+            // Determine visible chunk
             int viewChunk = 0;
             for (int c = N_CHUNKS - 1; c >= 0; --c) {
-                if (g_chunkPainted[c] && (int64_t)g_chunkOriginTick[c] <= viewLeftTick) {
-                    viewChunk = c; break;
+                if ((int64_t)g_chunkOriginTick[c] <= viewLeftTick) {
+                    viewChunk = c; 
+                    break;
                 }
             }
 
-            double intraChunkPx = (double)(viewLeftTick - (int64_t)g_chunkOriginTick[viewChunk]) * ppt;
+            // Calculate active scaling factor for texture coordinates
+            float activeTexScale = (float)g_chunkW / (float)(sw * 2);
+
+            double intraChunkPx = (double)(viewLeftTick - (int64_t)g_chunkOriginTick[viewChunk]) * g_pixPerTick;
             float srcX = (float)(viewChunk * g_chunkW) + (float)intraChunkPx;
             if (srcX < 0.f) srcX = 0.f;
 
-            // Check if right edge of view falls into next chunk
             int rightChunk = viewChunk;
-            if (viewChunk + 1 < N_CHUNKS && g_chunkPainted[viewChunk + 1]) {
-                if (viewRightTick > (int64_t)g_chunkOriginTick[viewChunk + 1])
+            if (viewChunk + 1 < N_CHUNKS) {
+                if (viewRightTick > (int64_t)g_chunkOriginTick[viewChunk + 1]) {
                     rightChunk = viewChunk + 1;
+                }
             }
 
             if (rightChunk == viewChunk) {
-                // Single chunk covers full view
-                float w = blitW;
-                if (srcX + w > (float)g_texW) w = (float)g_texW - srcX;
-                if (w > 0.f)
-                    DrawTexturePro(g_tex, { srcX,0.f,w,(float)PIX_H }, { dstX,top,w,uh }, { 0,0 }, 0.f, WHITE);
+                float screenW = blitW;
+                float texSrcW = screenW * activeTexScale;
+                if (srcX + texSrcW > (float)g_texW) {
+                    texSrcW = (float)g_texW - srcX;
+                    screenW = texSrcW / activeTexScale;
+                }
+                if (texSrcW > 0.f && screenW > 0.f) {
+                    DrawTexturePro(g_tex, { srcX, 0.f, texSrcW, (float)PIX_H }, { dstX, top, screenW, uh }, { 0,0 }, 0.f, WHITE);
+                }
             }
             else {
-                // View spans chunk boundary
                 float chunk1EndSrcX = (float)((viewChunk + 1) * g_chunkW);
-                float w1 = chunk1EndSrcX - srcX;
-                if (w1 > blitW) w1 = blitW;
-                if (w1 > 0.f)
-                    DrawTexturePro(g_tex, { srcX,0.f,w1,(float)PIX_H }, { dstX,top,w1,uh }, { 0,0 }, 0.f, WHITE);
+                float texW1 = chunk1EndSrcX - srcX;
+                float screenW1 = texW1 / activeTexScale;
+                if (screenW1 > blitW) {
+                    screenW1 = blitW;
+                    texW1 = screenW1 * activeTexScale;
+                }
+                if (texW1 > 0.f && screenW1 > 0.f) {
+                    DrawTexturePro(g_tex, { srcX, 0.f, texW1, (float)PIX_H }, { dstX, top, screenW1, uh }, { 0,0 }, 0.f, WHITE);
+                }
 
                 float srcX2 = (float)(rightChunk * g_chunkW);
-                float w2 = blitW - w1;
-                if (srcX2 + w2 > (float)g_texW) w2 = (float)g_texW - srcX2;
-                if (w2 > 0.f)
-                    DrawTexturePro(g_tex, { srcX2,0.f,w2,(float)PIX_H }, { dstX + w1,top,w2,uh }, { 0,0 }, 0.f, WHITE);
+                float screenW2 = blitW - screenW1;
+                float texW2 = screenW2 * activeTexScale;
+                if (srcX2 + texW2 > (float)g_texW) {
+                    texW2 = (float)g_texW - srcX2;
+                    screenW2 = texW2 / activeTexScale;
+                }
+                if (texW2 > 0.f && screenW2 > 0.f) {
+                    DrawTexturePro(g_tex, { srcX2, 0.f, texW2, (float)PIX_H }, { dstX + screenW1, top, screenW2, uh }, { 0,0 }, 0.f, WHITE);
+                }
             }
         }
     }
@@ -709,7 +863,7 @@ void DrawStreamingVisualizerNotes(
                 if (bTick < le) continue;
                 float bx = plx + (float)((int64_t)bTick - (int64_t)currentTick) * (float)ppt;
                 if (bx < -1.f || bx > sw + 1.f) continue;
-                Color c = (i == 0) ? Color{ 255,255,255,40 } : Color{ 255,255,255,20 };
+                Color c = (i == 0) ? Color{ 255,255,192,40 } : Color{ 255,255,255,20 };
                 DrawRectangleRec({ bx, top, 1.f, uh }, c);
             }
         }
@@ -729,9 +883,9 @@ void DrawStreamingVisualizerNotes(
     }
 
     // ---- Playhead + borders ----
-    DrawLine((int)plx, (int)top, (int)plx, sh - (int)bot, RED);
-    DrawLine(0, (int)top, sw, (int)top, GRAY);
-    DrawLine(0, sh - (int)bot, sw, sh - (int)bot, GRAY);
+    DrawLine((int)plx, (int)top, (int)plx, sh - (int)bot, Color{ 255,128,128,192 });
+    DrawLine(0, (int)top, sw, (int)top, Color{ 255,255,255,40 });
+    DrawLine(0, sh - (int)bot, sw, sh - (int)bot, Color{ 255,255,255,40 });
 }
 
 std::string FormatWithCommas(uint64_t value) {
@@ -1286,7 +1440,7 @@ void DrawDetailedLoadingScreen() {
     const char* phaseText = "Starting...";
     if (g_LoadProgress.loadPhase == 1) phaseText = "Parsing MIDI stream...";
     if (g_LoadProgress.loadPhase == 2) phaseText = "Optimizing and Sorting...";
-    DrawText(phaseText, barX, textY, 20, YELLOW); textY += 25;
+    DrawText(phaseText, barX, textY, 20, LIGHTGRAY); textY += 25;
     
     MemoryUsage mem = GetMemoryUsage();
     DrawText(TextFormat("Memory Usage: %llu MB (Committed: %llu MB)", mem.workingSetMB, mem.privateUsageMB), barX, textY, 20, LIGHTGRAY); 
@@ -1302,7 +1456,7 @@ static void BuildTempoSegs(int ppq) {
         if (ev.type != (uint8_t)EventType::TEMPO) continue;
         accumSec += (ev.tick - lastTick) * usPerTick / 1000000.0;
         lastTick  = ev.tick;
-        usPerTick = MidiTiming::CalculateMicrosecondsPerTick(ev.data.tempo, ppq);
+        usPerTick = MidiTiming::CalculateMicrosecondsPerTick(ev.getTempo(), ppq); // Corrected here
         g_tempoSegs.push_back({ ev.tick, accumSec, usPerTick });
     }
 }
@@ -1383,7 +1537,7 @@ static uint32_t TicksMinusSeconds(uint64_t targetTick, double seconds) {
 }
 
 // ===================================================================
-// DEBUG PANEL
+// DEBUG PANEL (AKA INFORMATION)
 // ===================================================================
 void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTempo, size_t eventListPos, size_t totalEvents, bool isPaused, float scrollSpeed, const std::vector<OptimizedTrackData>& tracks, bool isFinished) {
     float panelX = (GetScreenWidth() - DWidth) - 10.0f;
@@ -1422,14 +1576,14 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     currentY += lineHeight;
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
-    DrawText(TextFormat("Render notes: %llu / %llu (Textures)", renderNotes, maxRenderNotes), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    DrawText(TextFormat("Render notes: %llu / %llu (Textures)", renderNotes.load(), maxRenderNotes.load()), (int)(panelX + padding), (int)currentY, 10, WHITE);
 }
 
 // ===================================================================
 // PERFORMANCE DEBUG (NEW)
 // ===================================================================
 
-#define MAX_PERF_HISTORY 360
+#define MAX_PERF_HISTORY 400
 
 static int perfFpsHistory[MAX_PERF_HISTORY] = {0};
 static float perfFtHistory[MAX_PERF_HISTORY] = {0.0f};
@@ -1442,39 +1596,48 @@ static float perfFpsAvg = 0.0f;
 static float perfFtMin  = 0.0f, perfFtMax = 0.0f, perfFtAvg = 0.0f;
 static int   perfTpsMin = 0, perfTpsMax = 0;
 static float perfTpsAvg = 0.0f;
+static uint64_t perfEvpsHistory[MAX_PERF_HISTORY] = {0};
+static uint64_t perfEvpsMin = 0, perfEvpsMax = 0;
+static double   perfEvpsAvg = 0.0;
 static uint64_t lastCurrentVisualizerTick = 0;
 
-void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth) {
+void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth, uint64_t evps) {
     for (int i = 0; i < MAX_PERF_HISTORY - 1; i++) {
-        perfFpsHistory[i] = perfFpsHistory[i + 1];
-        perfFtHistory[i]  = perfFtHistory[i + 1];
-        perfTpsHistory[i] = perfTpsHistory[i + 1];
-        perfBufHistory[i] = perfBufHistory[i + 1];
+        perfFpsHistory[i]  = perfFpsHistory[i + 1];
+        perfFtHistory[i]   = perfFtHistory[i + 1];
+        perfTpsHistory[i]  = perfTpsHistory[i + 1];
+        perfBufHistory[i]  = perfBufHistory[i + 1];
+        perfEvpsHistory[i] = perfEvpsHistory[i + 1];
     }
-    perfFpsHistory[MAX_PERF_HISTORY - 1] = fps;
-    perfFtHistory[MAX_PERF_HISTORY - 1]  = ft;
-    perfTpsHistory[MAX_PERF_HISTORY - 1] = tps;
-    perfBufHistory[MAX_PERF_HISTORY - 1] = bufHealth;
+    perfFpsHistory[MAX_PERF_HISTORY - 1]  = fps;
+    perfFtHistory[MAX_PERF_HISTORY - 1]   = ft;
+    perfTpsHistory[MAX_PERF_HISTORY - 1]  = tps;
+    perfBufHistory[MAX_PERF_HISTORY - 1]  = bufHealth;
+    perfEvpsHistory[MAX_PERF_HISTORY - 1] = evps;
 
-    // Recompute min / max / avg over the full window
-    int   fpsMin = perfFpsHistory[0], fpsMax = perfFpsHistory[0];
-    float ftMin  = perfFtHistory[0],  ftMax  = perfFtHistory[0];
-    int   tpsMin = perfTpsHistory[0], tpsMax = perfTpsHistory[0];
-    double fpsSum = 0.0, ftSum = 0.0, tpsSum = 0.0;
+    int    fpsMin = perfFpsHistory[0], fpsMax = perfFpsHistory[0];
+    float  ftMin  = perfFtHistory[0],  ftMax  = perfFtHistory[0];
+    int    tpsMin = perfTpsHistory[0], tpsMax = perfTpsHistory[0];
+    uint64_t evpsMin = perfEvpsHistory[0], evpsMax = perfEvpsHistory[0];
+    double fpsSum = 0.0, ftSum = 0.0, tpsSum = 0.0, evpsSum = 0.0;
     for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-        fpsSum += perfFpsHistory[i];
-        ftSum  += perfFtHistory[i];
-        tpsSum += perfTpsHistory[i];
-        if (perfFpsHistory[i] < fpsMin) fpsMin = perfFpsHistory[i];
-        if (perfFpsHistory[i] > fpsMax) fpsMax = perfFpsHistory[i];
-        if (perfFtHistory[i]  < ftMin)  ftMin  = perfFtHistory[i];
-        if (perfFtHistory[i]  > ftMax)  ftMax  = perfFtHistory[i];
-        if (perfTpsHistory[i] < tpsMin) tpsMin = perfTpsHistory[i];
-        if (perfTpsHistory[i] > tpsMax) tpsMax = perfTpsHistory[i];
+        fpsSum  += perfFpsHistory[i];
+        ftSum   += perfFtHistory[i];
+        tpsSum  += perfTpsHistory[i];
+        evpsSum += (double)perfEvpsHistory[i];
+        if (perfFpsHistory[i]  < fpsMin)  fpsMin  = perfFpsHistory[i];
+        if (perfFpsHistory[i]  > fpsMax)  fpsMax  = perfFpsHistory[i];
+        if (perfFtHistory[i]   < ftMin)   ftMin   = perfFtHistory[i];
+        if (perfFtHistory[i]   > ftMax)   ftMax   = perfFtHistory[i];
+        if (perfTpsHistory[i]  < tpsMin)  tpsMin  = perfTpsHistory[i];
+        if (perfTpsHistory[i]  > tpsMax)  tpsMax  = perfTpsHistory[i];
+        if (perfEvpsHistory[i] < evpsMin) evpsMin = perfEvpsHistory[i];
+        if (perfEvpsHistory[i] > evpsMax) evpsMax = perfEvpsHistory[i];
     }
     perfFpsMin = fpsMin; perfFpsMax = fpsMax; perfFpsAvg = (float)(fpsSum / MAX_PERF_HISTORY);
     perfFtMin  = ftMin;  perfFtMax  = ftMax;  perfFtAvg  = (float)(ftSum  / MAX_PERF_HISTORY);
     perfTpsMin = tpsMin; perfTpsMax = tpsMax; perfTpsAvg = (float)(tpsSum / MAX_PERF_HISTORY);
+    perfEvpsMin = evpsMin; perfEvpsMax = evpsMax; perfEvpsAvg = evpsSum / MAX_PERF_HISTORY;
 }
 
 // ===================================================================
@@ -1528,8 +1691,8 @@ void Draw100PercentStackedColumn(int x, int y, int height, float val, const std:
 }
 
 void DrawPerformanceDebugPanel() {
-    int width = 380;
-    int height = 305;
+    int width = 420;
+    int height = 295;
     int px = GetScreenWidth() - width - 10;
     int py = GetScreenHeight() - height - 40;
     DrawRectangleRounded(Rectangle{(float)px, (float)py, (float)width, (float)height}, 0.1f, 32, Color{64, 64, 64, 128});
@@ -1538,38 +1701,41 @@ void DrawPerformanceDebugPanel() {
     int cx = px + 10;
     int cy = py + 10;
 
-    const int GW = 360; // graph width (1px each)
-    const int GH = 60;  // graph height in pixels
+    const int GW = 400; // graph width (1px each)
+    const int GH = 45;  // graph height in pixels
 
     DrawText("Performance", cx, cy, 20, WHITE);
-    int gw = MeasureText("Graphics", 20);
-    DrawText("Graphics", px + width - 12 - gw, cy, 20, WHITE);
+	cy += 25;
 
     // Tiers definitions mapping your thresholds from GetPerfColorList
     std::vector<PerfTier> fpsTiers = {
-        {0.0f, PDarkerRed}, {1.0f, PDarkerRed}, {5.0f, PDarkRed}, {10.0f, PRed}, 
+        {0.0f, BLACK}, {0.5f, PDarkerRed}, {1.0f, PDarkerRed}, {5.0f, PDarkRed}, {10.0f, PRed}, 
         {30.0f, POrange}, {60.0f, PYellow}, {240.0f, PGreen}, {960.0f, PBlue}, 
-        {1920.0f, PCyan}, {3000.0f, PMagenta}, {10000.0f, PWhite} // Upper cap
+        {1920.0f, PCyan}, {3000.0f, PMagenta}, {10000.0f, PWhite}
     };
     std::vector<PerfTier> ftTiers = {
         {0.0f, PWhite}, {0.5f, PWhite}, {1.0f, PMagenta}, {2.5f, PCyan}, 
         {5.0f, PBlue}, {10.0f, PGreen}, {30.0f, PYellow}, {100.0f, POrange}, 
-        {500.0f, PRed}, {1000.0f, PDarkRed}, {60000.0f, PDarkerRed}
+        {500.0f, PRed}, {1000.0f, PDarkRed}, {30000.0f, PDarkerRed}, {60000.0f, BLACK}
     };
 	std::vector<PerfTier> bufTiers = {
-            {0.0f, BLACK}, {0.5f, PDarkRed}, {1.0f, PRed}, {5.0f, POrange},
-            {10.0f, PYellow}, {30.0f, PGreen}, {60.0f, PBlue}, {150.0f, PCyan},
-            {300.0f, PMagenta}, {600.0f, PWhite}
-        };
+        {0.0f, BLACK}, {0.5f, PDarkRed}, {1.0f, PRed}, {5.0f, POrange},
+        {10.0f, PYellow}, {30.0f, PGreen}, {60.0f, PBlue}, {150.0f, PCyan},
+        {300.0f, PMagenta}, {600.0f, PWhite}
+    };
     std::vector<PerfTier> tpsTiers = {
-        {0.0f, PDarkerRed}, {60.0f, PDarkerRed}, {120.0f, PDarkRed}, {240.0f, PRed},
-        {480.0f, POrange}, {960.0f, PYellow}, {1920.0f, PGreen}, {3840.0f, PBlue},
-        {7680.0f, PCyan}, {15360.0f, PMagenta}, {30000.0f, PWhite} // Upper cap
+        {0.0f, BLACK}, {30.0f, PDarkerRed}, {60.0f, PDarkerRed}, {120.0f, PDarkRed},
+		{240.0f, PRed}, {480.0f, POrange}, {960.0f, PYellow}, {1920.0f, PGreen}, {3840.0f, PBlue},
+        {7680.0f, PCyan}, {15360.0f, PMagenta}, {30720.0f, PWhite}
+    };
+	std::vector<PerfTier> evpsTiers = {
+        {0.0f, BLACK}, {10.0f, PRed}, {100.0f, POrange}, {1000.0f, PYellow},
+		{10000.0f, PGreen}, {100000.0f, PBlue}, {1000000.0f, PCyan}, {10000000.0f, PMagenta},
+		{100000000.0f, PWhite}
     };
 
     // ---- FPS graph ----
-    cy += 25;
-    DrawText(TextFormat("Frame Per Seconds: %d  (%d / %d / %.0f)", perfFpsHistory[MAX_PERF_HISTORY - 1], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
+    DrawText(TextFormat("Graphics - Frames Per Second (Real-Time): %d  (%d / %d / %.0f)", perfFpsHistory[MAX_PERF_HISTORY - 1], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
     cy += 13;
 
     DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
@@ -1579,7 +1745,7 @@ void DrawPerformanceDebugPanel() {
 
     // ---- Frame Time graph ----
     cy += GH + 5;
-    DrawText(TextFormat("Frame Time: %.2f ms  (%.2f ms / %.2f ms / %.2f ms)", perfFtHistory[MAX_PERF_HISTORY - 1], perfFtMin, perfFtMax, perfFtAvg), cx, cy, 10, WHITE);
+    DrawText(TextFormat("Graphics - Frame Time: %.2f ms  (%.2f ms / %.2f ms / %.2f ms)", perfFtHistory[MAX_PERF_HISTORY - 1], perfFtMin, perfFtMax, perfFtAvg), cx, cy, 10, WHITE);
     cy += 13;
 
     DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
@@ -1588,12 +1754,9 @@ void DrawPerformanceDebugPanel() {
     }
 
     // ---- Bottom graph: TPS or Buffer Health ----
-    cy += GH + 10;
+    cy += GH + 5;
     
     if (g_BassEngine.IsInitialized() && g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender) {
-        int mw = MeasureText("Pre-Render", 20);
-        DrawText("Pre-Render", px + width - 12 - mw, cy, 20, WHITE);
-        cy += 25;
         auto prSt = g_BassEngine.GetPreRenderStatus();
         float curHealth = perfBufHistory[MAX_PERF_HISTORY - 1];
         float maxHealth = g_BassEngine.GetConfig().preRenderBufferSec;
@@ -1608,7 +1771,7 @@ void DrawPerformanceDebugPanel() {
                 dispVoices = (int)(minV + t * (maxV - minV));
                 dispVoices = std::clamp(dispVoices, minV, maxV);
             }
-            DrawText(TextFormat("Buffer: %.2f s / %.0f s (Progress: %.2f%% ~ Voices: %d/%d)",
+            DrawText(TextFormat("Pre-Render - Buffer: %.2f s / %.0f s (Progress: %.2f%% ~ Voices: %d/%d)",
                 curHealth, maxHealth, prSt.progress * 100.f, dispVoices, maxV),
                 cx, cy, 10, WHITE);
         }
@@ -1618,15 +1781,29 @@ void DrawPerformanceDebugPanel() {
             Draw100PercentStackedColumn(cx + i, cy, GH, perfBufHistory[i], bufTiers);
         }
     } else {
-        int mw = MeasureText("MIDI Output", 20);
-        DrawText("MIDI Output", px + width - 12 - mw, cy, 20, WHITE);
-        cy += 25;
-        DrawText(TextFormat("Tick Per Seconds: %d  (%d / %d / %.0f)", perfTpsHistory[MAX_PERF_HISTORY - 1], perfTpsMin, perfTpsMax, perfTpsAvg), cx, cy, 10, WHITE);
+        DrawText(TextFormat("MIDI - Ticks Per Second: %d  (%d / %d / %.0f)", perfTpsHistory[MAX_PERF_HISTORY - 1], perfTpsMin, perfTpsMax, perfTpsAvg), cx, cy, 10, WHITE);
         cy += 13;
         DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
         for (int i = 0; i < MAX_PERF_HISTORY; i++) {
             Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfTpsHistory[i], tpsTiers);
         }
+    }
+	cy += GH + 5;
+	bool evpsRecordingOn = g_AudioEngine.IsEventCounterRecordEnabled();
+	if (evpsRecordingOn) {
+		DrawText(TextFormat("MIDI - Events Per Second: %llu  (%llu / %llu / %.0f)", perfEvpsHistory[MAX_PERF_HISTORY - 1], perfEvpsMin, perfEvpsMax, perfEvpsAvg), cx, cy, 10, WHITE);
+	} else {
+		DrawText("MIDI - Events Per Second: [ DISABLED ]", cx, cy, 10, WHITE);
+	}
+    cy += 13;
+    if (evpsRecordingOn) {
+        DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
+        for (int i = 0; i < MAX_PERF_HISTORY; i++) {
+            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfEvpsHistory[i], evpsTiers);
+        }
+    } else {
+        DrawRectangle(cx, cy, GW, GH, Color{64, 64, 64, 128});
+        DrawText("[ DISABLED ]", cx + ( GW/2 - MeasureText("[ DISABLED ]", 10)/2 ), cy + (GH / 2) - 5, 10, LIGHTGRAY);
     }
 }
 
@@ -1637,8 +1814,7 @@ void DrawPerformanceDebugPanel() {
 static void SpawnParticle(BgParticle& p, bool randomX) {
     int sw = std::max(GetScreenWidth(),  1);
     int sh = std::max(GetScreenHeight(), 1);
-    p.x           = randomX ? (float)(rand() % sw)
-                             : (float)(sw + rand() % 300);
+    p.x           = randomX ? (float)(rand() % sw) : (float)(sw + rand() % 300);
     p.y           = (float)(rand() % sh);
     p.speedFactor = 0.5f + (rand() % 1000) / 1000.0f; // [0.50 – 1.50]
     p.sizeFactor  = 0.5f + (rand() % 1000) / 1000.0f;
@@ -1680,7 +1856,7 @@ int main(int argc, char* argv[]) {
     // the user can switch to BassMIDI from the Audio Config panel at runtime.
     bool kdmapiOk = InitializeKDMAPIStream();
     if (kdmapiOk) std::cout << "+ KDMAPI Initialized!" << std::endl;
-    else           std::cout << "[warn] KDMAPI init failed - switch to BassMIDI in Audio Config.\n";
+    else std::cout << "[warn] KDMAPI init failed - switch to BassMIDI in Audio Config." << std::endl;
     if (argc > 1) {
         selectedMidiFile = argv[1];
         std::cout << "+ File selection alived!" << std::endl;
@@ -1725,8 +1901,7 @@ int main(int argc, char* argv[]) {
 		.onStop  = [] { g_AudioEngine.Stop(); },
 		.onSeek  = [](int64_t targetMicros) {
 		g_AudioEngine.SeekAbsolute((uint64_t)targetMicros);
-	},
-	});
+	},});
     // eventList lives in load.cpp; access via GetGlobalMidiEvents()
 	uint32_t frameupdate = 0;
     uint16_t ppq = 480;
@@ -1758,7 +1933,7 @@ int main(int argc, char* argv[]) {
 					g_LoaderThread = std::thread([&]() {
 						int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal,
-                                    timeSigNumerator, timeSigDenominator, &g_LoadProgress);
+						timeSigNumerator, timeSigDenominator, &g_LoadProgress, g_enableOverlapRemove);
 						
 						// Assign out variables carefully
 						ppq = (uint16_t)iPpq;
@@ -1815,13 +1990,13 @@ int main(int argc, char* argv[]) {
 					
 				// Start playing immediately!
                 firstPause = true;
-                currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                {
-                    const auto& evs = GetGlobalMidiEvents();
-                    if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
-                        currentTempo = evs[0].data.tempo;
-                    g_AudioEngine.Start(evs, ppq, currentTempo);
-                }
+				currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+				{
+					const auto& evs = GetGlobalMidiEvents();
+					if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
+						currentTempo = evs[0].getTempo(); // Corrected here
+					g_AudioEngine.Start(evs, ppq, currentTempo);
+				}
                 g_AudioEngine.SetSpeed(MidiSpeed);
                 g_AudioEngine.SetLooping(isLoop);
                 g_AudioEngine.Pause();
@@ -1835,7 +2010,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "UP = Fast speed (+0.01x)" << std::endl;
                 std::cout << "DOWN = Slow speed (-0.01x)" << std::endl;
                 std::cout << "S = Normal speed (1.00x)" << std::endl;
-                std::cout << "E = Anti-slowdown when Event skipped (Almost but there issue)." << std::endl;
+                std::cout << "E = Toggle Event Skip" << std::endl;
                 std::cout << "R = Restart playback" << std::endl;
                 std::cout << "J = Start loop" << std::endl;
                 std::cout << "K = End loop" << std::endl;
@@ -1884,23 +2059,23 @@ int main(int argc, char* argv[]) {
 			}
             case STATE_PLAYING: {
                 if (IsKeyPressed(KEY_R) && !firstPause) {
-                    noteCounter = 0;
+					noteCounter = 0;
 					maxRenderNotes = 0;
 					g_maxNps = 0;
 					g_maxPoly = 0;
-                    InvalidateNoteBuffer(); // reset texture to tick 0 before restart
-                    g_AudioEngine.Stop();
-                    currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                    {
-                        const auto& evs = GetGlobalMidiEvents();
-                        if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
-                            currentTempo = evs[0].data.tempo;
-                        g_AudioEngine.Start(evs, ppq, currentTempo);
-                    }
-                    g_AudioEngine.SetSpeed(MidiSpeed);
-                    g_AudioEngine.SetLooping(isLoop);
-                    if (!isLoop) std::cout << "- Playback Restarted" << std::endl;
-                }
+					InvalidateNoteBuffer(); 
+					g_AudioEngine.Stop();
+					currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+					{
+						const auto& evs = GetGlobalMidiEvents();
+						if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
+							currentTempo = evs[0].getTempo();
+						g_AudioEngine.Start(evs, ppq, currentTempo);
+					}
+					g_AudioEngine.SetSpeed(MidiSpeed);
+					g_AudioEngine.SetLooping(isLoop);
+					if (!isLoop) std::cout << "- Playback Restarted" << std::endl;
+				}
                 if (IsKeyPressed(KEY_SPACE)) {
                     if (firstPause) firstPause = false;
                     if (g_AudioEngine.IsPaused()) {
@@ -2007,9 +2182,9 @@ int main(int argc, char* argv[]) {
                         showBeats = !showBeats; 
                         std::cout << "- Beats " << (showBeats ? "visible" : "invisible") << std::endl; }
                     if (IsKeyPressed(KEY_T)) {
-                        g_viewerType = (g_viewerType == ViewerType::ChannelTrackLayer) ? ViewerType::TickLayer : ViewerType::ChannelTrackLayer;
+                        g_viewerType = (g_viewerType == ViewerType::TrackLayer) ? ViewerType::TickLayer : ViewerType::TrackLayer;
                         InvalidateNoteBuffer();
-                        std::cout << "- Viewer: " << (g_viewerType == ViewerType::ChannelTrackLayer ? "Channel+Track Layer" : "Tick Layer") << std::endl; }
+                        std::cout << "- Viewer: " << (g_viewerType == ViewerType::TrackLayer ? "Track Layer" : "Tick Layer") << std::endl; }
                     if (IsKeyPressed(KEY_L)) { 
                         isLoop = !isLoop;
                         g_AudioEngine.SetLooping(isLoop);
@@ -2068,7 +2243,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 if (IsKeyPressed(KEY_M)) {
-                    maxRenderNotes = 0;
+                    maxRenderNotes.store(0, std::memory_order_relaxed);
 					g_maxNps = 0;
 					g_maxPoly = 0;
                     std::cout << "- Max render notes reset" << std::endl; }
@@ -2101,18 +2276,19 @@ int main(int argc, char* argv[]) {
                 bool isFinished = g_AudioEngine.IsFinished();
                 uint64_t currentVisualizerTick = g_AudioEngine.GetCurrentTick();
                 uint32_t currentTempo = g_AudioEngine.GetCurrentTempo();
+				float dt = GetFrameTime();
+				uint64_t evps = (!isPaused && !isFinished) ? g_AudioEngine.GetEventsPerSecond() : 0;
 				int tps = 0;
                 if (!isPaused && !isFinished) {
-                    float dt = GetFrameTime();
-                    if (dt > 0.0f) {
-                        tps = (int)(((double)currentVisualizerTick - (double)lastCurrentVisualizerTick) / dt);
-                        if (tps < 0) tps = 0;
-                    }
-                }
+					if (dt > 0.0f) {
+						tps = (int)(((double)currentVisualizerTick - (double)lastCurrentVisualizerTick) / dt);
+						if (tps < 0) tps = 0;
+					}
+				}
                 lastCurrentVisualizerTick = currentVisualizerTick;
                 
                 float currentBufHealth = (float)g_BassEngine.GetBufferHealthSeconds();
-                UpdatePerformanceHistory(GetFPS(), GetFrameTime() * 1000.0f, tps, currentBufHealth);
+                UpdatePerformanceHistory(1 / GetFrameTime(), GetFrameTime() * 1000.0f, tps, currentBufHealth, evps);
                 
                 static bool finishedPrinted = false;
                 if (isFinished && !finishedPrinted) {
@@ -2126,13 +2302,6 @@ int main(int argc, char* argv[]) {
                 if (currentVisualizerTick != lastCounterTick) {
                     noteCounter = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(), std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
                     lastCounterTick = currentVisualizerTick;
-
-                    // NPS: count note-ons in the 1-second real-time window ending at the
-                    // current tick.  We derive winStart by walking the tempo map backward
-                    // (TicksMinusSeconds) so that any BPM change inside the window does NOT
-                    // warp the tick range -- this prevents the false NPS spike/drop that the
-                    // naive "windowTicks = ticksPerSecond_at_currentTempo" formula produces
-                    // every time the song crosses a tempo event.
                     if (ppq > 0 && !g_tempoSegs.empty()) {
                         uint32_t winStart = TicksMinusSeconds(currentVisualizerTick, 1.0);
                         uint32_t winEnd   = (uint32_t)currentVisualizerTick;
@@ -2141,27 +2310,13 @@ int main(int argc, char* argv[]) {
                         g_currentNps = (uint64_t)std::distance(lo, hi);
                         if (g_currentNps > g_maxNps) g_maxNps = g_currentNps;
                     }
-
-                    // Polyphony: notes that have started but not yet ended at currentVisualizerTick.
-                    //
-                    // A note is "playing" during [startTick, endTick] (closed interval).
-                    //   started = upper_bound(startTicks, T)  → startTick <= T
-                    //   ended   = lower_bound(endTicks,   T)  → endTick   <  T
-                    //
-                    // Using lower_bound for ended means a note whose endTick == T is still
-                    // counted as playing at tick T (it ends *after* this tick).  This is
-                    // consistent with the renderer which draws zero-duration notes as
-                    // rawEnd = startTick + 1 — those notes are visible for at least one tick.
-                    // The old upper_bound erroneously counted endTick==T notes as already gone,
-                    // making zero-duration and boundary-overlap notes invisible to polyphony.
-                    {
-                        uint64_t started = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(),
-                            std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
-                        uint64_t ended   = (uint64_t)std::distance(g_sortedNoteEndTicks.begin(),
-                            std::lower_bound(g_sortedNoteEndTicks.begin(), g_sortedNoteEndTicks.end(), (uint32_t)currentVisualizerTick));
-                        g_currentPoly = (started > ended) ? (started - ended) : 0;
-                        if (g_currentPoly > g_maxPoly) g_maxPoly = g_currentPoly;
-                    }
+                    
+                    uint64_t started = (uint64_t)std::distance(g_sortedNoteStartTicks.begin(),
+                    std::upper_bound(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end(), (uint32_t)currentVisualizerTick));
+                    uint64_t ended   = (uint64_t)std::distance(g_sortedNoteEndTicks.begin(),
+                    std::lower_bound(g_sortedNoteEndTicks.begin(), g_sortedNoteEndTicks.end(), (uint32_t)currentVisualizerTick));
+                    g_currentPoly = (started > ended) ? (started - ended) : 0;
+                    if (g_currentPoly > g_maxPoly) g_maxPoly = g_currentPoly;
                 }
 				frameupdate++;
 				g_Smtc.UpdatePlaybackState( g_AudioEngine.IsFinished() ? false : true,
@@ -2311,14 +2466,9 @@ int main(int argc, char* argv[]) {
                     // ── Pin window to top-right, resize each frame so it hugs its content ──
                     ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - 372.0f, 40.0f), ImGuiCond_Always);
                     ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Always); // height = auto
-                 
+                    
                     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
-                 
-					// If you want apply save in "JIDIC" JSON files after close or manual save
-					// And open window after load "JIDIC.json" automatic
-					
-					// Actually if i open ".mid" files after create window will create automatic ImGui files. Disable it
-					
+                    
                     if (ImGui::Begin("Options [F9]", &showOptions, wflags)) {
 						// ── Playback ─────────────────────────────────────────────────────
 						if (ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2438,10 +2588,16 @@ int main(int argc, char* argv[]) {
 								ImGui::TextDisabled("A/B not set (full-song loop)");
 							ImGui::Separator();
 				 
-							// Anti-slowdown checkbox
-							if (ImGui::Checkbox("Anti-Slowdown", &isAntiSlowdown)) {
+							// Event skip checkbox
+							if (ImGui::Checkbox("Toggle Event Skip", &isAntiSlowdown)) {
 								g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
 							}
+							ImGui::SameLine();
+								// Event counter record (Information only)
+								bool eventCounterRecordUI = g_AudioEngine.IsEventCounterRecordEnabled();
+								if (ImGui::Checkbox("Event counter record", &eventCounterRecordUI)) {
+									g_AudioEngine.ToggleEventCounterRecord(eventCounterRecordUI);
+								}
 				 
 							// Seek buttons
 							ImGui::Spacing();
@@ -2461,6 +2617,7 @@ int main(int argc, char* argv[]) {
 						if (g_BassEngine.GetActiveMode() == AudioMode::KDMAPI)
 							DrawLagSimulatorPanel(g_AudioEngine);
 						else {
+                            ImGui::Separator();
 							ImGui::TextDisabled("Lag Simulator disabled (BassMIDI mode active).");
 						}
 				 
@@ -2486,15 +2643,20 @@ int main(int argc, char* argv[]) {
 									beatSubdivisions = subdiv;
 								}
 							}
+							
+							if (ImGui::Checkbox("Render Overlap Remove", &g_enableOverlapRemove)) {
+								InvalidateNoteBuffer();
+							}
+							if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Enable to filter overlaps during parsing.\nNote: Requires reloading the MIDI file to update counters, NPS, and Polyphony.");
+							}
 				 
 							// Layer selector: matches the T key toggle
-							// No updates at render after change layer.
 							int layerIdx = (g_viewerType == ViewerType::TickLayer) ? 1 : 0;
-							const char* layers[] = { "Channel / Track", "Tick Layer" };
+							const char* layers[] = { "Track Layer", "Tick Layer" };
 							if (ImGui::Combo("Layer", &layerIdx, layers, IM_ARRAYSIZE(layers))) {
-								g_viewerType = (layerIdx == 1)
-											 ? ViewerType::TickLayer
-											 : ViewerType::ChannelTrackLayer;
+								g_viewerType = (layerIdx == 1) ? ViewerType::TickLayer : ViewerType::TrackLayer;
+                                InvalidateNoteBuffer();
 							}
 						}
 				 
