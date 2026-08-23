@@ -32,7 +32,8 @@ inline std::string GetConfigPath(const std::string& filename) {
 static bool   s_AudioPanelOpen       = false; 
 static float  s_PreRenderBufSec      = 60.0f;
 static int    s_Voices               = 512;
-static int    s_VelIgnore            = 2;
+inline bool   s_KdmapiVelIgnore      = false;
+inline int    s_VelIgnore            = 2;
 static bool   s_LowBuffer            = false;
 static int    s_LowBufferMinVoices   = 16;
 static bool   s_SfxEnabled           = true;
@@ -91,6 +92,7 @@ inline void SaveAudioConfig() {
         out << "  \"AudioMode\": " << (int)cur.mode << ",\n";
         out << "  \"Voices\": " << cur.voices << ",\n";
         out << "  \"VelIgnore\": " << (int)cur.velocityIgnore << ",\n";
+        out << "  \"KdmapiVelIgnore\": " << (s_KdmapiVelIgnore ? 1 : 0) << ",\n";
         out << "  \"SfxEnabled\": " << (cur.sfxEnabled ? 1 : 0) << ",\n";
         out << "  \"Volume\": " << g_BassEngine.GetVolume() << ",\n";
         out << "  \"PreRenderBufSec\": " << cur.preRenderBufferSec << ",\n";
@@ -130,8 +132,10 @@ inline void SaveAudioConfig() {
         out << "  \"LagSimEps\": " << s_lagSimEps << ",\n";
         out << "  \"LagSmoothRender\": " << (g_AudioEngine.GetLagSmoothRender() ? 1 : 0) << ",\n";
         
-        // --- 5. Loop Settings ---
+        // --- 5. Loop/OR Settings ---
         out << "  \"LoopEnabled\": " << (isLoop ? 1 : 0) << ",\n";
+        out << "  \"OverlapRemove\": " << (g_enableOverlapRemove ? 1 : 0) << ",\n";
+        out << "  \"RenderOverlapRemove\": " << (g_enableRenderOverlapRemove ? 1 : 0) << ",\n";
         
         // --- 6. Display/Render Settings ---
         out << "  \"IsHUD\": " << (isHUD ? 1 : 0) << ",\n";
@@ -143,7 +147,10 @@ inline void SaveAudioConfig() {
         out << "  \"Fullscreen\": " << (IsWindowFullscreen() ? 1 : 0) << ",\n";
         out << "  \"ScrollSpeed\": " << ScrollSpeed << ",\n";
         out << "  \"MidiSpeed\": " << MidiSpeed << ",\n";
+		out << "  \"IsTempoOverride\": " << (IsTempoOverride ? 1 : 0) << ",\n";
+		out << "  \"TempoSet\": " << TempoSet << ",\n";
         out << "  \"ViewerType\": " << (int)g_viewerType << ",\n";
+        out << "  \"TransparentWindow\": " << (int)g_transparentWindow << ",\n";
         
         // --- 7. Soundfonts ---
         const auto& fonts = g_BassEngine.GetSoundFonts();
@@ -158,7 +165,7 @@ inline void SaveAudioConfig() {
     }
 }
 
-// Loads just what is required prior to Device BASS_Init
+// Loads just what is required prior to Window & Audio initialization
 inline void PreInitAudioConfig() {
     std::string path = GetConfigPath("JIDIC.json");
     std::ifstream in(path);
@@ -170,6 +177,9 @@ inline void PreInitAudioConfig() {
             else if (line.find("\"LatencyMs\"") != std::string::npos) cfg.latencyMs = ExtractJsonInt(line);
             else if (line.find("\"LowVelScaleMaxSec\"") != std::string::npos) cfg.lowVelScaleMaxSec = ExtractJsonFloat(line);
             else if (line.find("\"LowBufferMinVoices\"") != std::string::npos) cfg.lowBufferMinVoices = ExtractJsonInt(line);
+            else if (line.find("\"TransparentWindow\"") != std::string::npos) {
+                g_transparentWindow = (ExtractJsonInt(line) != 0);
+            }
         }
         g_BassEngine.ApplyConfig(cfg);
         s_SampleRate = cfg.sampleRate;
@@ -193,6 +203,9 @@ inline void LoadAudioConfig() {
             if (line.find("\"AudioMode\"") != std::string::npos) cfg.mode = (AudioMode)ExtractJsonInt(line);
             else if (line.find("\"Voices\"") != std::string::npos) cfg.voices = ExtractJsonInt(line);
             else if (line.find("\"VelIgnore\"") != std::string::npos) cfg.velocityIgnore = ExtractJsonInt(line);
+            else if (line.find("\"KdmapiVelIgnore\"") != std::string::npos) {
+                s_KdmapiVelIgnore = ExtractJsonInt(line) != 0;
+            }
             else if (line.find("\"SfxEnabled\"") != std::string::npos) cfg.sfxEnabled = ExtractJsonInt(line) != 0;
             else if (line.find("\"Volume\"") != std::string::npos) g_BassEngine.SetVolume(ExtractJsonFloat(line));
             else if (line.find("\"PreRenderBufSec\"") != std::string::npos) cfg.preRenderBufferSec = ExtractJsonFloat(line);
@@ -240,6 +253,14 @@ inline void LoadAudioConfig() {
                 isLoop = ExtractJsonInt(line) != 0;
                 g_AudioEngine.SetLooping(isLoop);
             }
+
+            // Overlap Remove
+            else if (line.find("\"OverlapRemove\"") != std::string::npos) {
+                g_enableOverlapRemove = ExtractJsonInt(line) != 0;
+            }
+            else if (line.find("\"RenderOverlapRemove\"") != std::string::npos) {
+                g_enableRenderOverlapRemove = ExtractJsonInt(line) != 0;
+            }
             
             // Display/HUD Settings
             else if (line.find("\"IsHUD\"") != std::string::npos) isHUD = ExtractJsonInt(line) != 0;
@@ -254,6 +275,8 @@ inline void LoadAudioConfig() {
                 MidiSpeed = ExtractJsonFloat(line);
                 g_AudioEngine.SetSpeed(MidiSpeed);
             }
+			else if (line.find("\"IsTempoOverride\"") != std::string::npos) IsTempoOverride = (ExtractJsonInt(line) != 0);
+			else if (line.find("\"TempoSet\"") != std::string::npos) TempoSet = ExtractJsonFloat(line);
             else if (line.find("\"ViewerType\"") != std::string::npos) g_viewerType = (ViewerType)ExtractJsonInt(line);
             
             // Soundfont Lines
@@ -362,13 +385,14 @@ inline void DrawAudioConfigPanel()
         ImGui::Spacing();
 
         static const char* kModeLabels[] = {
-            "KDMAPI  (OmniMIDI / default)",
-            "BassMIDI  Real-Time",
-            "BassMIDI  Pre-Render (Live Streaming Buffer)",
+            "KDMAPI (Default)",
+            "BassMIDI Real-Time",
+            "BassMIDI Pre-Render",
+            "Spectator Audio (File)",
         };
         int modeIdx = (int)cur.mode;
         ImGui::TextDisabled("Audio backend:");
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             bool sel = (modeIdx == i);
             if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.38f, 0.58f, 1.f));
             if (ImGui::Button(kModeLabels[i])) {
@@ -388,6 +412,26 @@ inline void DrawAudioConfigPanel()
         }
         ImGui::Unindent(8.f);
     }
+	
+		if (cur.mode == AudioMode::SpectatorAudio) {
+		ImGui::Spacing();
+		ImGui::Separator();
+		ImGui::Text("Spectator Audio File:");
+		
+		static char spectatorPathBuf[512] = "";
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70.f);
+		ImGui::InputText("##SpectatorPath", spectatorPathBuf, sizeof(spectatorPathBuf));
+		ImGui::SameLine();
+		if (ImGui::Button("Load##Spec")) {
+			if (spectatorPathBuf[0] != '\0') {
+				if (g_BassEngine.LoadSpectatorAudioFile(spectatorPathBuf)) {
+					SendNotification(300, 50, SSUCCESS, "Spectator Audio Loaded!", 3.0f);
+				} else {
+					SendNotification(300, 50, SERROR, "Failed to load Audio File", 3.0f);
+				}
+			}
+		}
+	}
 
     ImGui::Spacing();
 
@@ -407,7 +451,7 @@ inline void DrawAudioConfigPanel()
         }
         ImGui::SameLine();
         struct VoicePreset { const char* lbl; int v; };
-        static constexpr VoicePreset kVP[] = { {"64",1<<6},{"128",1<<7},{"256",1<<8},{"512",1<<9},{"1K",1024},{"4K",4096} };
+        static constexpr VoicePreset kVP[] = { {"64",1<<6},{"128",1<<7},{"256",1<<8},{"512",1<<9},{"1K",1024},{"2K",2048},{"4K",4096} };
         for (auto& vp : kVP) {
             bool cur2 = (s_Voices == vp.v);
             if (cur2) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f,0.44f,0.22f,1));
@@ -430,6 +474,8 @@ inline void DrawAudioConfigPanel()
         if (ImGui::SliderInt("Vel. Ignore##vi", &s_VelIgnore, 0, 127)) {
             g_BassEngine.SetVelocityIgnore((uint8_t)s_VelIgnore);
         }
+        ImGui::SameLine();
+        ImGui::Checkbox("KDMAPI Ignore Velocity##kdmvi", &s_KdmapiVelIgnore);
 
         if (ImGui::Checkbox("Sound Effects (Soundfont)", &s_SfxEnabled)) g_BassEngine.SetSfxEnabled(s_SfxEnabled);
 
@@ -458,9 +504,7 @@ inline void DrawAudioConfigPanel()
     }
 
     ImGui::Spacing();
-
-    bool isPR = (cur.mode == AudioMode::BassMIDI_PreRender);
-    if (isPR) {
+    if (cur.mode == AudioMode::BassMIDI_PreRender) {
         ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.22f, 0.12f, 0.32f, 1.f));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.32f, 0.18f, 0.46f, 1.f));
         ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.42f, 0.22f, 0.58f, 1.f));

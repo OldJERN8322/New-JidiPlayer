@@ -1,12 +1,28 @@
 #ifdef _WIN32
 
-// Prevent Windows GDI and USER API name collisions with Raylib
+// Prevent Windows GDI, USER, and Sound API name collisions with Raylib
 #define NOGDI
 #define NOUSER
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#define MMNOSOUND
 
 #include <windows.h>
+
+// Undefine Windows macros that conflict with Raylib symbols
+#ifdef PlaySound
+#  undef PlaySound
+#endif
+#ifdef DrawText
+#  undef DrawText
+#endif
+#ifdef CloseWindow
+#  undef CloseWindow
+#endif
+#ifdef ShowCursor
+#  undef ShowCursor
+#endif
+
 #include <bass.h>
 #include <bassmidi.h>
 
@@ -78,6 +94,10 @@ struct BassPreRenderEngine::Impl {
     std::string               prErrorMsg;
     mutable std::mutex        prMsgMutex;
 
+    // Spectator Audio Stream
+    HSTREAM     spectatorStream = 0;
+    std::string spectatorFilePath;
+
     bool MakeStream(DWORD flags) {
         if (midiStream) { BASS_StreamFree(midiStream); midiStream = 0; }
         midiStream = BASS_MIDI_StreamCreate(16, flags | BASS_SAMPLE_FLOAT, cfg.sampleRate);
@@ -126,6 +146,22 @@ struct BassPreRenderEngine::Impl {
         float t = (float)(bufHealthSec / (double)scaleMax); 
         float result = 127.0f + t * ((float)cfg.velocityIgnore - 127.0f);
         return (uint8_t)std::clamp((int)result, (int)cfg.velocityIgnore, 127);
+    }
+
+    bool LoadSpectatorFile(const std::string& path) {
+        if (spectatorStream) {
+            BASS_StreamFree(spectatorStream);
+            spectatorStream = 0;
+        }
+        
+        spectatorStream = BASS_StreamCreateFile(FALSE, path.c_str(), 0, 0, BASS_SAMPLE_FLOAT);
+        if (!spectatorStream) {
+            std::cerr << "[BassEngine] Failed to load Spectator Audio: " << BASS_ErrorGetCode() << "\n";
+            return false;
+        }
+        spectatorFilePath = path;
+        BASS_ChannelSetAttribute(spectatorStream, BASS_ATTRIB_VOL, volume);
+        return true;
     }
 };
 
@@ -197,6 +233,7 @@ bool BassPreRenderEngine::Init(void* hwnd) {
             return false;
         }
     }
+    BASS_PluginLoad("bassflac.dll", 0);
     impl->initialized = true;
 
     if (impl->cfg.mode == AudioMode::BassMIDI_RT) {
@@ -210,6 +247,7 @@ void BassPreRenderEngine::Shutdown() {
     CancelPreRender();
     if (impl->pushStream) { BASS_StreamFree(impl->pushStream); impl->pushStream = 0; }
     if (impl->midiStream) { BASS_StreamFree(impl->midiStream); impl->midiStream = 0; }
+    if (impl->spectatorStream) { BASS_StreamFree(impl->spectatorStream); impl->spectatorStream = 0; }
     {
         std::lock_guard<std::mutex> lk(impl->fontMutex);
         for (auto& fe : impl->fonts) impl->UnloadFont(fe);
@@ -275,6 +313,7 @@ void BassPreRenderEngine::SetVelocityIgnore(uint8_t v) {
         impl->pcmCV.notify_all();
     }
 }
+
 void BassPreRenderEngine::SetSfxEnabled(bool on) { 
     if (!impl) return;
     impl->cfg.sfxEnabled = on; 
@@ -283,6 +322,7 @@ void BassPreRenderEngine::SetSfxEnabled(bool on) {
         impl->pcmCV.notify_all();
     }
 }
+
 void BassPreRenderEngine::SetPlaybackSpeed(float speed) {
     if (!impl) return;
     float old = impl->playbackSpeed;
@@ -292,6 +332,7 @@ void BassPreRenderEngine::SetPlaybackSpeed(float speed) {
         impl->pcmCV.notify_all();
     }
 }
+
 void BassPreRenderEngine::SetPreRenderBufferSec(float sec) { 
     if (!impl) return;
     float old = impl->cfg.preRenderBufferSec;
@@ -301,6 +342,7 @@ void BassPreRenderEngine::SetPreRenderBufferSec(float sec) {
         impl->pcmCV.notify_all();
     }
 }
+
 void BassPreRenderEngine::SetLowBufferMode(bool on) { if (impl) impl->cfg.lowBufferMode = on; }
 
 AudioMode BassPreRenderEngine::GetActiveMode() const { return impl ? impl->cfg.mode : AudioMode::KDMAPI; }
@@ -474,8 +516,8 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
 
                 if (skip) continue;
 
-                uint32_t delta = ev.tick - lastWrittenTick;
-                lastWrittenTick = ev.tick;
+                uint32_t delta = (ev.tick >= lastWrittenTick) ? (ev.tick - lastWrittenTick) : 0;
+                lastWrittenTick = std::max(lastWrittenTick, ev.tick);
 
                 if (et == EventType::TEMPO) {
                     uint32_t t = (uint32_t)(ev.getTempo() / speed);
@@ -508,6 +550,14 @@ void BassPreRenderEngine::StartPreRender(const void* rawEvents, size_t eventCoun
                     writeVlq(trackData, delta);
                     trackData.push_back(static_cast<uint8_t>(0xC0 | ev.channel));
                     trackData.push_back(ev.getValue());
+                } else if (et == EventType::SYSEX) {
+                    const auto& sdata = GetSysExData(ev.getValue());
+                    if (sdata.size() > 1 && sdata[0] == 0xF0) {
+                        writeVlq(trackData, delta);
+                        trackData.push_back(0xF0);
+                        writeVlq(trackData, (uint32_t)(sdata.size() - 1));
+                        trackData.insert(trackData.end(), sdata.begin() + 1, sdata.end());
+                    }
                 }
             }
 
@@ -776,39 +826,78 @@ void BassPreRenderEngine::SendMidiData(uint32_t msg) {
     BASS_MIDI_StreamEvents(impl->midiStream, BASS_MIDI_EVENTS_RAW, &msg, 3);
 }
 
+void BassPreRenderEngine::SendSysEx(const void* data, size_t length) {
+    if (!impl || !impl->midiStream || !data || length == 0) return;
+    BASS_MIDI_StreamEvents(impl->midiStream, BASS_MIDI_EVENTS_RAW, data, (DWORD)length);
+}
+
+void DispatchSysExOut(const void* data, size_t length) {
+    if (!data || length == 0) return;
+    if (g_BassEngine.IsInitialized()) {
+        AudioMode mode = g_BassEngine.GetActiveMode();
+        if (mode == AudioMode::BassMIDI_RT) {
+            g_BassEngine.SendSysEx(data, length);
+            return;
+        } else if (mode == AudioMode::BassMIDI_PreRender || mode == AudioMode::SpectatorAudio) {
+            return;
+        }
+    }
+
+    struct LocalMIDIHDR {
+        char*         lpData;
+        DWORD         dwBufferLength;
+        DWORD         dwBytesRecorded;
+        DWORD_PTR     dwUser;
+        DWORD         dwFlags;
+        LocalMIDIHDR* lpNext;
+        DWORD_PTR     reserved;
+        DWORD         dwOffset;
+        DWORD_PTR     dwReserved[8];
+    };
+
+    typedef unsigned long (__stdcall *SendDirectLongDataFunc)(LocalMIDIHDR*);
+    static SendDirectLongDataFunc pSendDirectLongData = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        HMODULE hMod = GetModuleHandleA("OmniMIDI");
+        if (!hMod) hMod = GetModuleHandleA("KDMAPI");
+        if (hMod) pSendDirectLongData = (SendDirectLongDataFunc)GetProcAddress(hMod, "SendDirectLongData");
+        resolved = true;
+    }
+
+    if (pSendDirectLongData) {
+        LocalMIDIHDR hdr{};
+        hdr.lpData = const_cast<char*>(static_cast<const char*>(data));
+        hdr.dwBufferLength = (DWORD)length;
+        hdr.dwBytesRecorded = (DWORD)length;
+        pSendDirectLongData(&hdr);
+    }
+}
+
 void BassPreRenderEngine::Play() {
     if (!impl) return;
-    if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
+    if (impl->cfg.mode == AudioMode::SpectatorAudio && impl->spectatorStream) {
+        BASS_ChannelPlay(impl->spectatorStream, FALSE);
+    } else if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
         if (!impl->pushStream) return;
-
-        if (BASS_ChannelIsActive(impl->pushStream) == BASS_ACTIVE_STOPPED) {
-            const double minFillSec = 1.0;
-            double health = GetBufferHealthSeconds();
-            if (health < minFillSec && impl->prRunning.load()) {
-                for (int tries = 0; tries < 3000 && impl->prRunning.load(); ++tries) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    health = GetBufferHealthSeconds();
-                    if (health >= minFillSec) break;
-                }
-            }
-        }
-
         bool restart = impl->prSeekFlush.exchange(false);
         BASS_ChannelPlay(impl->pushStream, restart ? TRUE : FALSE);
-    } else {
-        if (impl->midiStream) BASS_ChannelPlay(impl->midiStream, FALSE);
+    } else if (impl->midiStream) {
+        BASS_ChannelPlay(impl->midiStream, FALSE);
     }
 }
 
 void BassPreRenderEngine::Pause() {
     if (!impl) return;
-    HSTREAM s = (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
+    HSTREAM s = (impl->cfg.mode == AudioMode::SpectatorAudio) ? impl->spectatorStream : 
+                (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
     if (s) BASS_ChannelPause(s);
 }
 
 void BassPreRenderEngine::Stop() {
     if (!impl) return;
-    HSTREAM s = (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
+    HSTREAM s = (impl->cfg.mode == AudioMode::SpectatorAudio) ? impl->spectatorStream : 
+                (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
     if (s) { 
         BASS_ChannelStop(s); 
         if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
@@ -824,8 +913,23 @@ void BassPreRenderEngine::Stop() {
 
 void BassPreRenderEngine::SeekTo(uint64_t seekVirtualMicros) {
     if (!impl) return;
-    if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
+    if (impl->cfg.mode == AudioMode::SpectatorAudio && impl->spectatorStream) {
+        QWORD bytePos = BASS_ChannelSeconds2Bytes(impl->spectatorStream, (double)seekVirtualMicros / 1'000'000.0);
+        BASS_ChannelSetPosition(impl->spectatorStream, bytePos, BASS_POS_BYTE);
+    } else if (impl->cfg.mode == AudioMode::BassMIDI_PreRender) {
         if (impl->pushStream) {
+            BASS_ChannelStop(impl->pushStream);
+
+            uint64_t targetPhysicalMicros = (uint64_t)(seekVirtualMicros / impl->lastRenderedSpeed);
+            uint64_t targetSamples = (uint64_t)((targetPhysicalMicros / 1000000.0) * impl->cfg.sampleRate * 2);
+            targetSamples &= ~1ULL;
+
+            {
+                std::lock_guard<std::mutex> lk(impl->pcmMutex);
+                impl->pcmWritePos = targetSamples;
+                impl->pcmReadPos  = targetSamples;
+            }
+
             impl->seekTargetMicros.store(seekVirtualMicros);
             impl->seekReq.store(true);
             impl->pcmCV.notify_all(); 
@@ -839,20 +943,28 @@ void BassPreRenderEngine::SeekTo(uint64_t seekVirtualMicros) {
 
 bool BassPreRenderEngine::IsPlaying() const {
     if (!impl) return false;
-    HSTREAM s = (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
+    HSTREAM s = (impl->cfg.mode == AudioMode::SpectatorAudio) ? impl->spectatorStream :
+                (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
     return s && (BASS_ChannelIsActive(s) == BASS_ACTIVE_PLAYING);
 }
 
 bool BassPreRenderEngine::IsPaused() const {
     if (!impl) return false;
-    HSTREAM s = (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
+    HSTREAM s = (impl->cfg.mode == AudioMode::SpectatorAudio) ? impl->spectatorStream :
+                (impl->cfg.mode == AudioMode::BassMIDI_PreRender) ? impl->pushStream : impl->midiStream;
     return s && (BASS_ChannelIsActive(s) == BASS_ACTIVE_PAUSED);
 }
 
 uint64_t BassPreRenderEngine::GetPositionMicros() const {
     if (!impl) return 0;
-    if (impl->cfg.mode == AudioMode::BassMIDI_PreRender && impl->pushStream) {
+    if (impl->cfg.mode == AudioMode::SpectatorAudio && impl->spectatorStream) {
+        QWORD pos = BASS_ChannelGetPosition(impl->spectatorStream, BASS_POS_BYTE);
+        if (pos == (QWORD)-1) return 0;
+        return (uint64_t)(BASS_ChannelBytes2Seconds(impl->spectatorStream, pos) * 1'000'000.0);
+    } else if (impl->cfg.mode == AudioMode::BassMIDI_PreRender && impl->pushStream) {
         DWORD queuedBytes = BASS_ChannelGetData(impl->pushStream, NULL, BASS_DATA_AVAILABLE);
+        if (queuedBytes == (DWORD)-1) queuedBytes = 0;
+        
         int64_t floatPos = 0;
         {
             std::lock_guard<std::mutex> lk(impl->pcmMutex);
@@ -863,9 +975,14 @@ uint64_t BassPreRenderEngine::GetPositionMicros() const {
         return (uint64_t)(physicalMicros * impl->lastRenderedSpeed);
     } else if (impl->midiStream) {
         QWORD pos = BASS_ChannelGetPosition(impl->midiStream, BASS_POS_BYTE);
+        if (pos == (QWORD)-1) return 0;
         return (uint64_t)(BASS_ChannelBytes2Seconds(impl->midiStream, pos) * 1'000'000.0);
     }
     return 0;
+}
+
+bool BassPreRenderEngine::LoadSpectatorAudioFile(const std::string& path) {
+    return impl ? impl->LoadSpectatorFile(path) : false;
 }
 
 void BassPreRenderEngine::SetVolume(float v) {
@@ -873,6 +990,7 @@ void BassPreRenderEngine::SetVolume(float v) {
     impl->volume = std::clamp(v, 0.0f, 1.0f);
     if (impl->midiStream) BASS_ChannelSetAttribute(impl->midiStream, BASS_ATTRIB_VOL, impl->volume);
     if (impl->pushStream) BASS_ChannelSetAttribute(impl->pushStream, BASS_ATTRIB_VOL, impl->volume);
+    if (impl->spectatorStream) BASS_ChannelSetAttribute(impl->spectatorStream, BASS_ATTRIB_VOL, impl->volume);
 }
 
 float BassPreRenderEngine::GetVolume() const {

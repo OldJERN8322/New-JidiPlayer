@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 class MidiOutputEngine {
 public:
@@ -17,6 +18,7 @@ public:
     void Seek(int64_t microsecondOffset);
 	void SeekAbsolute(uint64_t targetMicroseconds);
     void SetSpeed(float newSpeed);
+    float GetPlaybackSpeed() const;
     void SetLooping(bool loop);
     uint64_t GetCurrentTick() const;
     size_t GetEventPos() const;
@@ -30,6 +32,18 @@ public:
 	uint64_t GetLoopEndTick()   const;
     void ToggleAntiSlowdown(bool enabled);
     bool IsAntiSlowdownEnabled() const;
+
+    // ---------------------------------------------------------------
+    // Tempo Override — hold a fixed real-world BPM as the song's own
+    // tempo track changes underneath it. Lives in the engine (not the UI)
+    // so it's evaluated on the playback thread the instant a TEMPO event
+    // is processed, rather than being polled once per rendered frame —
+    // which meant it drifted or froze depending on which UI code path
+    // happened to run that frame (Options panel open vs. closed, etc.).
+    // ---------------------------------------------------------------
+    void  SetTempoOverride(bool enabled, float targetBpm);
+    bool  IsTempoOverrideEnabled() const;
+    float GetTempoOverrideTarget() const;
 
     // Event counter record (Information only) — gates the EVPS/dispatch
     // stats accumulator, NOT playback advancement. See PlaybackThread():
@@ -73,6 +87,7 @@ private:
     void SilenceAllChannels();
     void SilenceAllChannelsWithoutCC();
     void BuildTempoIndex();
+    void ApplyTempoOverride(); // recompute+apply playbackSpeed to hold tempoOverrideTargetBpm
 
     // Built once in Start(). Each entry marks a tempo change point.
     struct TempoSegment {
@@ -93,12 +108,23 @@ private:
     std::atomic<uint64_t> currentVisualizerTick;
     std::atomic<float> playbackSpeed;
     std::chrono::steady_clock::time_point playbackStartTime;
+    // Guards {playbackStartTime, playbackSpeed} as one consistent unit.
+    // PlaybackThread() reads this pair every loop iteration while SetSpeed(),
+    // Pause(), Resume(), Start(), Seek(), and LoopBackToTick() all write it
+    // from other threads (e.g. a UI slider firing many SetSpeed() calls per
+    // second while dragging). Without this lock the reader can observe a
+    // just-updated speed paired with a stale start time (or vice versa),
+    // which makes the tick loop think a huge amount of virtual time has
+    // passed and dump a burst of queued events in one go.
+    std::mutex timingMutex;
     double accumulatedMicroseconds;
     double pauseVirtualMicros;
     std::atomic<size_t> eventPos;
     uint32_t lastProcessedTick;
     double microsecondsPerTick;
     std::atomic<uint32_t> currentTempo;
+    std::atomic<bool>  tempoOverrideEnabled{false};
+    std::atomic<float> tempoOverrideTargetBpm{120.0f};
 	std::atomic<uint64_t> loopStartTick{ 0 };
 	std::atomic<uint64_t> loopEndTick{ UINT64_MAX };
 	std::atomic<bool>     hasLoopPoints{ false };

@@ -149,7 +149,7 @@ struct TempoEvent {
 };
 
 // ===== UNIFIED MIDI EVENT STRUCTURE =====
-enum class EventType : uint8_t { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE };
+enum class EventType : uint8_t { NOTE_ON, NOTE_OFF, CC, TEMPO, PITCH_BEND, PROGRAM_CHANGE, CHANNEL_PRESSURE, SYSEX };
 enum class ViewerType : uint8_t { TrackLayer, TickLayer };
 enum class InputMode : uint8_t { Normal, Simulate };
 
@@ -209,6 +209,7 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 // Sorted MidiEvent list produced by loadStreamingMidiData().
 // Call after loading; pass directly to MidiOutputEngine::Start().
 const std::vector<MidiEvent>& GetGlobalMidiEvents();
+const std::vector<uint8_t>& GetSysExData(uint32_t index);
 
 // ===================================================================
 // GLOBAL CONFIGURATION SETTINGS (Placed at bottom to resolve types)
@@ -222,8 +223,13 @@ extern bool showPerformance;
 extern bool showOptions;
 extern ViewerType g_viewerType;
 
+extern bool g_enableOverlapRemove;
+extern bool g_enableRenderOverlapRemove;
+extern bool g_enableRoundedNotes;
+
 extern float g_bgColorF[4];
 extern Color g_backgroundColor;
+extern bool g_transparentWindow;
 
 extern bool g_particleShow;
 extern int g_particleCount;
@@ -244,5 +250,7 @@ extern bool isHUD;
 extern bool isLoop;
 extern float ScrollSpeed;
 extern float MidiSpeed;
+extern bool IsTempoOverride;
+extern float TempoSet;
 
 extern int64_t s_lagSimEps;

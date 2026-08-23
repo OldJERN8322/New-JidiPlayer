@@ -16,6 +16,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <cassert>
+#include <deque>
 
 namespace {
 
@@ -112,6 +113,13 @@ struct PendingNote {
 } // namespace
 
 static std::vector<MidiEvent> s_globalEvents;
+static std::vector<std::vector<uint8_t>> s_sysexPool;
+
+const std::vector<uint8_t>& GetSysExData(uint32_t index) {
+    static const std::vector<uint8_t> empty;
+    if (index < s_sysexPool.size()) return s_sysexPool[index];
+    return empty;
+}
 
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
     std::vector<TempoEvent> tempos;
@@ -141,14 +149,22 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
 
             uint8_t statusByte = r.readU8(); consume(1);
 
+            uint8_t firstData = 0xFF;
             if (statusByte & 0x80) {
-                if (statusByte < 0xF0) runStatus = statusByte;
+                if (statusByte < 0xF0) {
+                    runStatus = statusByte;
+                } else {
+                    runStatus = 0;
+                }
+            } else {
+                firstData = statusByte;
+                statusByte = runStatus;
             }
 
-            uint8_t status = (statusByte & 0x80) ? statusByte : runStatus;
-            uint8_t firstData = (statusByte & 0x80) ? 0xFF : statusByte; 
+            uint8_t status = statusByte;
 
             if (status == 0xFF) {
+                runStatus = 0;
                 uint8_t  metaType = r.readU8(); consume(1);
                 uint32_t metaLen  = r.readVLQ(); consume(0);
                 if (metaType == 0x51 && metaLen == 3) {
@@ -158,6 +174,7 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
                     r.skip(metaLen); consume(metaLen);
                 }
             } else if (status == 0xF0 || status == 0xF7) {
+                runStatus = 0;
                 uint32_t sysLen = r.readVLQ(); consume(0);
                 r.skip(sysLen); consume(sysLen);
             } else {
@@ -193,6 +210,7 @@ std::vector<CCEvent> loadStreamingMidiData(
     std::vector<CCEvent> ccEvents;
 
     s_globalEvents.clear();
+    s_sysexPool.clear();
 
     if (r.totalSize > 0) {
         size_t estimatedEvents = r.totalSize / 4; 
@@ -219,7 +237,7 @@ std::vector<CCEvent> loadStreamingMidiData(
             td.notes.reserve(std::max<size_t>(notesPerTrack, 1024));
     }
 
-    std::vector<PendingNote> pendingNotes[16][128];
+    std::deque<PendingNote> pendingNotes[16][128];
 
     for (uint16_t trackIdx = 0; trackIdx < nTracks && !r.eof(); ++trackIdx) {
         uint32_t chunkId  = r.readU32();
@@ -254,6 +272,8 @@ std::vector<CCEvent> loadStreamingMidiData(
             if (statusByte & 0x80) {
                 if (statusByte < 0xF0) {
                     runStatus = statusByte;
+                } else {
+                    runStatus = 0; // MIDI Spec: SysEx and Meta cancel running status
                 }
             } else {
                 firstData = statusByte;
@@ -261,6 +281,7 @@ std::vector<CCEvent> loadStreamingMidiData(
             }
 
             if (statusByte == 0xFF) {
+                runStatus = 0;
                 if (bytesLeft < 1) break;
                 uint8_t metaType = r.readU8(); bytesLeft--;
 
@@ -273,15 +294,15 @@ std::vector<CCEvent> loadStreamingMidiData(
                 }
 
                 if (metaType == 0x51 && metaLen == 3 && bytesLeft >= 3) {
-					uint32_t tempoVal = r.readU24(); bytesLeft -= 3;
-					if (absTick == 0 && s_globalEvents.empty() &&
-						initialTempo == (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS) {
-						initialTempo = (int)tempoVal;
-					}
-					MidiEvent ev(absTick, EventType::TEMPO, 0);
-					ev.setTempo(tempoVal);   
-					s_globalEvents.push_back(ev);
-				} else if (metaType == 0x58 && metaLen == 4 && bytesLeft >= 4) {
+                    uint32_t tempoVal = r.readU24(); bytesLeft -= 3;
+                    if (absTick == 0 && s_globalEvents.empty() &&
+                        initialTempo == (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS) {
+                        initialTempo = (int)tempoVal;
+                    }
+                    MidiEvent ev(absTick, EventType::TEMPO, 0);
+                    ev.setTempo(tempoVal);   
+                    s_globalEvents.push_back(ev);
+                } else if (metaType == 0x58 && metaLen == 4 && bytesLeft >= 4) {
                     uint8_t nn = r.readU8(); bytesLeft--;
                     uint8_t dd = r.readU8(); bytesLeft--;
                     r.readU8(); bytesLeft--; 
@@ -307,6 +328,8 @@ std::vector<CCEvent> loadStreamingMidiData(
             }
 
             if (statusByte == 0xF0 || statusByte == 0xF7) {
+                runStatus = 0; // Cancel running status
+                
                 uint32_t sysLen = 0;
                 for (int i = 0; i < 4; ++i) {
                     if (bytesLeft == 0) break;
@@ -314,8 +337,26 @@ std::vector<CCEvent> loadStreamingMidiData(
                     sysLen = (sysLen << 7) | (b & 0x7F);
                     if (!(b & 0x80)) break;
                 }
+
                 if (sysLen > 0 && bytesLeft >= sysLen) {
-                    r.skip(sysLen); bytesLeft -= sysLen;
+                    std::vector<uint8_t> msg;
+                    msg.reserve(sysLen + 1);
+                    
+                    if (statusByte == 0xF0) {
+                        msg.push_back(0xF0);
+                    }
+                    
+                    size_t startPos = msg.size();
+                    msg.resize(startPos + sysLen);
+                    r.readBytes(msg.data() + startPos, sysLen);
+                    bytesLeft -= sysLen;
+
+                    uint32_t sysexIndex = (uint32_t)s_sysexPool.size();
+                    s_sysexPool.push_back(std::move(msg));
+
+                    MidiEvent ev(absTick, EventType::SYSEX, 0);
+                    ev.setValue(sysexIndex);
+                    s_globalEvents.push_back(ev);
                 }
                 continue;
             }
@@ -332,26 +373,26 @@ std::vector<CCEvent> loadStreamingMidiData(
             };
 
             auto doNoteOff = [&](uint8_t note) {
-			MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
-			ev.setNote(note, 0);
-			s_globalEvents.push_back(ev);
+                MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
+                ev.setNote(note, 0);
+                s_globalEvents.push_back(ev);
 
                 auto& list = pendingNotes[channel][note];
                 if (!list.empty()) {
-                    auto oldest = list.begin();
+                    const PendingNote& oldest = list.front();
                     NoteEvent ne{};
-                    ne.startTick   = oldest->startTick;
+                    ne.startTick   = oldest.startTick;
                     ne.endTick     = absTick;
                     ne.note        = note;
-                    ne.velocity    = oldest->velocity;
+                    ne.velocity    = oldest.velocity;
                     ne.channel     = channel;
-                    ne.visualTrack = oldest->visualTrack;
+                    ne.visualTrack = oldest.visualTrack;
                     tracks[vtrack].notes.push_back(ne);
                     totalNoteCount++;
                     if (progress && (totalNoteCount % 500 == 0)) {
                         progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
-                    list.erase(oldest);
+                    list.pop_front();
                 }
             };
 
@@ -363,29 +404,33 @@ std::vector<CCEvent> loadStreamingMidiData(
                     break;
                 }
                 case 0x90: {   
-					uint8_t note = readData();
-					uint8_t vel  = readData();
-					if (vel == 0) {
-						doNoteOff(note); 
-					} else {
-						MidiEvent ev(absTick, EventType::NOTE_ON, channel);
-						ev.setNote(note, vel);
-						s_globalEvents.push_back(ev);
-						
-						pendingNotes[channel][note].push_back(PendingNote{ absTick, vel, vtrack });
-					}
-					break;
-				}
-				case 0xB0: {   
-					uint8_t ctrl = readData();
-					uint8_t val  = readData();
-					if (ctrl == 120 || ctrl == 121 || ctrl == 123) {
-						break;
-					}
-					{
-						MidiEvent ev(absTick, EventType::CC, channel);
-						ev.setCC(ctrl, val);
-						s_globalEvents.push_back(ev);
+                    uint8_t note = readData();
+                    uint8_t vel  = readData();
+                    if (vel == 0) {
+                        doNoteOff(note); 
+                    } else {
+                        MidiEvent ev(absTick, EventType::NOTE_ON, channel);
+                        ev.setNote(note, vel);
+                        s_globalEvents.push_back(ev);
+                        
+                        pendingNotes[channel][note].push_back(PendingNote{ absTick, vel, vtrack });
+                    }
+                    break;
+                }
+                case 0xB0: {   
+                    uint8_t ctrl = readData();
+                    uint8_t val  = readData();
+                    
+                    // Permitted all standard controllers including CC 121 (Reset All Controllers)
+                    // Only drop real-time all-notes-off CC 120/123 to prevent visualizer cutoff
+                    if (ctrl == 120 || ctrl == 123) {
+                        break;
+                    }
+
+                    {
+                        MidiEvent ev(absTick, EventType::CC, channel);
+                        ev.setCC(ctrl, val);
+                        s_globalEvents.push_back(ev);
 
                         CCEvent cc{};
                         cc.tick       = absTick;
@@ -397,27 +442,28 @@ std::vector<CCEvent> loadStreamingMidiData(
                     break;
                 }
                 case 0xE0: {   
-					uint8_t lsb = readData();
-					uint8_t msb = readData();
-					MidiEvent ev(absTick, EventType::PITCH_BEND, channel);
-					ev.setPitchBend(lsb, msb);
-					s_globalEvents.push_back(ev);
-					break;
-				}
-				case 0xC0: {   
-					uint8_t prog = readData();
-					MidiEvent ev(absTick, EventType::PROGRAM_CHANGE, channel);
-					ev.setValue(prog);
-					s_globalEvents.push_back(ev);
-					break;
-				}
-				case 0xD0: {   
-					uint8_t pressure = readData();
-					MidiEvent ev(absTick, EventType::CHANNEL_PRESSURE, channel);
-					ev.setValue(pressure);
-					s_globalEvents.push_back(ev);
-					break;
-				} case 0xA0: {   
+                    uint8_t lsb = readData();
+                    uint8_t msb = readData();
+                    MidiEvent ev(absTick, EventType::PITCH_BEND, channel);
+                    ev.setPitchBend(lsb, msb);
+                    s_globalEvents.push_back(ev);
+                    break;
+                }
+                case 0xC0: {   
+                    uint8_t prog = readData();
+                    MidiEvent ev(absTick, EventType::PROGRAM_CHANGE, channel);
+                    ev.setValue(prog);
+                    s_globalEvents.push_back(ev);
+                    break;
+                }
+                case 0xD0: {   
+                    uint8_t pressure = readData();
+                    MidiEvent ev(absTick, EventType::CHANNEL_PRESSURE, channel);
+                    ev.setValue(pressure);
+                    s_globalEvents.push_back(ev);
+                    break;
+                }
+                case 0xA0: {   
                     readData(); readData();
                     break;
                 }
@@ -453,8 +499,8 @@ std::vector<CCEvent> loadStreamingMidiData(
 
         if (bytesLeft > 0) r.skip((uint32_t)bytesLeft);
     }
-	
-	if (progress) {
+    
+    if (progress) {
         progress->currentNotes = totalNoteCount;
         progress->loadPhase = 2; 
     }
@@ -464,8 +510,7 @@ std::vector<CCEvent> loadStreamingMidiData(
         for (auto& td : tracks) {
             if (td.notes.empty()) continue;
 
-            // Sort by note pitch first, then channel, then startTick, then endTick descending
-            std::sort(td.notes.begin(), td.notes.end(),
+            std::stable_sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     if (a.note != b.note) return a.note < b.note;
                     if (a.channel != b.channel) return a.channel < b.channel;
@@ -482,15 +527,12 @@ std::vector<CCEvent> loadStreamingMidiData(
                 auto& last = cleanNotes.back();
 
                 if (last.note == next.note && last.channel == next.channel) {
-                    // If they start on the exact same tick, discard the duplicate shorter one
                     if (last.startTick == next.startTick) {
                         continue; 
                     }
-                    // Truncate previous note if it extends into/past the start of the next note
                     if (last.endTick > next.startTick) {
                         last.endTick = next.startTick;
                     }
-                    // Safety floor clamp
                     if (last.endTick <= last.startTick) {
                         last.endTick = last.startTick + 1;
                     }
@@ -500,24 +542,21 @@ std::vector<CCEvent> loadStreamingMidiData(
 
             td.notes = std::move(cleanNotes);
 
-            // Restore startTick sorting for visualizer compatibility
-            std::sort(td.notes.begin(), td.notes.end(),
+            std::stable_sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     return a.startTick < b.startTick;
                 });
             td.notes.shrink_to_fit(); 
         }
 
-        // Recalculate true visual note count
         totalNoteCount = 0;
         for (const auto& td : tracks) {
             totalNoteCount += td.notes.size();
         }
     } else {
-        // If bypass overlap removal, still sort tracks by startTick so binary search functions
         for (auto& td : tracks) {
             if (td.notes.empty()) continue;
-            std::sort(td.notes.begin(), td.notes.end(),
+            std::stable_sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     return a.startTick < b.startTick;
                 });
@@ -525,26 +564,30 @@ std::vector<CCEvent> loadStreamingMidiData(
         }
     }
 
-    std::sort(s_globalEvents.begin(), s_globalEvents.end(),
+    // Strict priority ordering: TEMPO (0) -> SYSEX (1) -> NOTE_OFF (2) -> CC (3) -> PROGRAM_CHANGE (4) -> PITCH/PRESS (5) -> NOTE_ON (6)
+    std::stable_sort(s_globalEvents.begin(), s_globalEvents.end(),
         [](const MidiEvent& a, const MidiEvent& b) {
             if (a.tick != b.tick) return a.tick < b.tick;
-            bool aTempo = (a.type == (uint8_t)EventType::TEMPO);
-            bool bTempo = (b.type == (uint8_t)EventType::TEMPO);
-            if (aTempo != bTempo) return aTempo > bTempo; 
             
             auto pri = [](uint8_t t) -> int {
-				if (t == (uint8_t)EventType::TEMPO)    return 0;
-				if (t == (uint8_t)EventType::NOTE_OFF) return 1;
-				if (t == (uint8_t)EventType::NOTE_ON)  return 2;
-				return 3;
-			};
-			if (pri(a.type) != pri(b.type)) return pri(a.type) < pri(b.type);
-			return false;
+                switch ((EventType)t) {
+                    case EventType::TEMPO:            return 0;
+                    case EventType::SYSEX:            return 1;
+                    case EventType::NOTE_OFF:         return 2;
+                    case EventType::CC:               return 3;
+                    case EventType::PROGRAM_CHANGE:   return 4;
+                    case EventType::PITCH_BEND:       return 5;
+                    case EventType::CHANNEL_PRESSURE: return 5;
+                    case EventType::NOTE_ON:          return 6;
+                    default:                          return 7;
+                }
+            };
+            return pri(a.type) < pri(b.type);
         });
 
     s_globalEvents.shrink_to_fit(); 
 
-    std::sort(ccEvents.begin(), ccEvents.end(),
+    std::stable_sort(ccEvents.begin(), ccEvents.end(),
         [](const CCEvent& a, const CCEvent& b){
             return a.tick < b.tick;
         });

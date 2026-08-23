@@ -64,18 +64,16 @@ target("jidi-player")
     -- NOTE: no top-level local helpers — after_build runs in a sandboxed scope
     -- and cannot see locals defined outside the target block.
     after_build(function(target)
-        local out_dir  = target:targetdir()
-        local bass_bin = "external/bass/bin/x64"
-        for _, dll in ipairs({ "bass.dll", "bassmidi.dll" }) do
-            local src = bass_bin .. "/" .. dll
-            if os.isfile(src) then
-                os.cp(src, out_dir)
-                print("[bass] copied " .. dll .. " → " .. out_dir)
-            else
-                print("[warn] BASS DLL not found, skipping: " .. src)
-            end
-        end
-    end)
+		local out_dir  = target:targetdir()
+		local bass_bin = "external/bass/bin/x64"
+		for _, dll in ipairs({ "bass.dll", "bassmidi.dll", "bassflac.dll" }) do
+			local src = bass_bin .. "/" .. dll
+			if os.isfile(src) then
+				os.cp(src, out_dir)
+				print("[BASS] copied " .. dll .. " → " .. out_dir)
+			end
+		end
+	end)
 
     -- ── Packages ──────────────────────────────────────────────────────────────
     add_packages("raylib", "imgui", "nlohmann_json")

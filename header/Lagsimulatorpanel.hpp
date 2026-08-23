@@ -116,17 +116,20 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
     // ── Preset buttons ────────────────────────────────────────
     struct Preset { const char* label; int64_t eps; const char* tip; };
     static constexpr Preset kPresets[] = {
-        { "Potato",   	512,         "Fishy usage." 						  },
-        { "Lower",   	1024,        "Catastrophic - barely a tick per burst" },
-        { "Low",   		8192,        "Heavy lag, clear chord smear"           },
-        { "Mid",   		32768,       "Noticeable on dense passages"           },
-        { "Default",  	65536,       "Balanced starting point"                },
-        { "Saturand",	262144,  	 "Different than Default preset x4"       },
-        { "Saturand+",  524288,      "Near-real-time, light stutter only"     },
-        { "Fast",  		1048576,     "Different than Saturand preset x4"      },
-        { "Faster",  	4194304,     "Different than Fast preset x4"      	  },
-        { "Faster+",  	8388608,     "Different than Faster preset x2"        },
-        { "Uncapped", 	134217728LL, "Effectively unlimited (2^27)"           },
+        { "Potato",   	512,         "Fishy usage." 						  				},
+        { "Lower",   	1024,        "Catastrophic - barely a tick per burst" 				},
+        { "Low",   		8192,        "Heavy lag, clear chord smear"           				},
+        { "Mid",   		32768,       "Noticeable on dense passages"           				},
+        { "Default",  	65536,       "Balanced starting point"                				},
+        { "Standard",	262144,  	 "Different than Default preset x4"       				},
+        { "Standard+",  524288,      "Near-real-time, light stutter only"     				},
+        { "Fast",  		1048576,     "Different than Standard preset x4"      				},
+        { "Fast+",  	2097152,     "Different than Standard preset x8"      				},
+        { "Faster",  	4194304,     "Different than Fast preset x4"      	  				},
+        { "Faster+",  	8388608,     "Different than Faster preset x2"        				},
+        { "Powerful",  	16777216LL,  "Different than Faster preset x4"        				},
+        { "Powerful+",  20971520LL,  "Synth Powerful Than Syndrv/OmniMIDI (Non-skip event)"	},
+        { "Uncapped", 	134217728LL, "Effectively unlimited (2^27)"           				},
     };
 
     ImGui::TextDisabled("Presets:");
@@ -136,7 +139,7 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
     ImGuiStyle& style = ImGui::GetStyle();
     float window_visible_x2 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
 
-    for (int i = 0; i < 11; ++i) {
+    for (int i = 0; i < 14; ++i) {
         const auto& p = kPresets[i];
         bool isCurrent = (s_lagSimEps == p.eps);
         
@@ -150,7 +153,7 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
         if (isCurrent) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%lld eps", p.tip, (long long)p.eps);
 
-        if (i < 10) {
+        if (i < 13) {
             float last_button_x2 = ImGui::GetItemRectMax().x;
             float next_button_x2 = last_button_x2 + style.ItemSpacing.x + ImGui::CalcTextSize(kPresets[i+1].label).x + style.FramePadding.x * 2.0f;
             if (next_button_x2 < window_visible_x2) {

@@ -12,9 +12,10 @@
 
 // ── Audio backend mode ────────────────────────────────────────────────────────
 enum class AudioMode : uint8_t {
-    KDMAPI           = 0,  // Original path — SendDirectData (KDMAPI / OmniMIDI)
-    BassMIDI_RT,           // BassMIDI stream, real-time send (low latency)
-    BassMIDI_PreRender,    // BassMIDI pre-rendered live PCM stream
+    KDMAPI           = 0,  // KDMAPI / OmniMIDI
+    BassMIDI_RT,           // BassMIDI Real-Time
+    BassMIDI_PreRender,    // BassMIDI Pre-Render
+    SpectatorAudio,        // External audio file (MP3/OGG/FLAC/WAV)
 };
 
 // ── Soundfont list entry ──────────────────────────────────────────────────────
@@ -90,6 +91,9 @@ public:
     const   std::vector<SoundFontEntry>& GetSoundFonts() const;
     void    ReloadAllSoundFonts();
 
+    // Spectator Audio (MP3/OGG/FLAC/WAV)
+    bool    LoadSpectatorAudioFile(const std::string& path);
+
     void    StartPreRender(const void* rawEvents, size_t eventCount,
                            int ppq, uint32_t initialTempoBPM,
                            uint64_t totalMicros);
@@ -98,6 +102,7 @@ public:
     double  GetBufferHealthSeconds() const;
 
     void    SendMidiData(uint32_t msg);
+    void    SendSysEx(const void* data, size_t length);
 
     void    Play();
     void    Pause();
@@ -127,16 +132,16 @@ inline void DispatchMidiOut(uint32_t msg) {
     if (g_BassEngine.IsInitialized()) {
         AudioMode mode = g_BassEngine.GetActiveMode();
         if (mode == AudioMode::BassMIDI_RT) {
-            g_BassEngine.SendMidiData(msg); // Only send live to Bass if in Real-Time mode
+            g_BassEngine.SendMidiData(msg);
         } else if (mode == AudioMode::KDMAPI) {
             SendDirectData((unsigned long)msg);
         }
-        // If BassMIDI_PreRender is active, audio is already stored in the buffer. 
-        // We do absolutely nothing here so we don't trigger phantom/duplicate notes!
     } else {
         SendDirectData((unsigned long)msg);
     }
 }
+
+void DispatchSysExOut(const void* data, size_t length);
 #endif // BASS_DISPATCH_DEFINED
 
 #endif // _WIN32

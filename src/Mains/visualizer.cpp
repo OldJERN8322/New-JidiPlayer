@@ -6,6 +6,7 @@
 #include "smtc_bridge.hpp"
 #include "bass_backend.hpp"       // BassMIDI pre-render engine + DispatchMidiOut
 #include "AudioConfigPanel.hpp"   // DrawAudioConfigPanel() / ToggleAudioConfigPanel()
+#include "file_dialog_win32.hpp"  // native "Open File" dialog for loading .mid/.midi
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -90,13 +91,18 @@ bool showBeats = true; // Toggle for beats
 bool showDebug = false; // Toggle for debug
 bool showPerformance = false; // Toggle for Performance
 bool showOptions = false;
-bool g_enableOverlapRemove = false; // Toggle for render overlap removal
+bool g_enableOverlapRemove = false; // Toggle for complete overlap removal
+bool g_enableRenderOverlapRemove = false; // Toggle for render overlap removal
+bool g_enableRoundedNotes = false; // Toggle for rounded note end-caps
 ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
+bool g_transparentWindow = false; // Global value before Init Window
 static bool firstPause = true; // Loads do first pause (kept static since it is only used here)
 static AppState currentState = STATE_MENU;
 static std::string selectedMidiFile = "Empty"; 
 float ScrollSpeed = 0.5f;
 float MidiSpeed = 1.00f;
+bool IsTempoOverride = false;
+float TempoSet = 120.0f;
 int cursorPos = 0;
 std::atomic<uint64_t> renderNotes{0};
 std::atomic<uint64_t> maxRenderNotes{0};
@@ -157,10 +163,9 @@ std::string inputBuffer;
 uint16_t ppq = 0;
 uint16_t timeSigNumerator   = 4; // overwritten from MIDI meta 0x58 at load time
 uint16_t timeSigDenominator = 4; // overwritten from MIDI meta 0x58 at load time
-static int beatSubdivisions = 4;
 uint64_t ticksPerBeat = (ppq * 4) / timeSigDenominator;
 uint64_t ticksPerMeasure = 0;
-float DWidth = 300.0f, DHeight = 125.0f;
+float DWidth = 360.0f, DHeight = 135.0f;
 uint64_t noteCounter = 0, noteTotal = 0;
 static LoadProgress g_LoadProgress;
 static std::thread g_LoaderThread;
@@ -196,17 +201,74 @@ static uint64_t g_maxPoly     = 0;    // peak polyphony seen so far this file
 
 static std::atomic<bool>  g_seekInvalidate{ false };
 static constexpr int      PIX_H     = 128;
-static constexpr int      N_CHUNKS  = 4;   // 1 current + 3 ahead
+// Need save/load json here i guess
+static constexpr int      MAX_CHUNKS = 16; // hard cap = fixed array size backing g_numChunks
+static int                 g_numChunks = 6; // runtime-adjustable via Options > Render > "Render Chunks" (2-16)
 
 static Texture2D             g_tex        = { 0 };
-static int                   g_texW       = 0;   // = N_CHUNKS * screenWidth
+static int                   g_texW       = 0;   // = g_numChunks * screenWidth
 static int                   g_chunkW     = 0;   // = screenWidth
 static double                g_pixPerTick = 0.0;
 static uint32_t              g_bufOriginTick = 0;  // tick at pixel col 0
 static std::vector<uint32_t> g_pixBuf;             // [PIX_H rows][g_texW cols]
+static uint64_t              g_windowOffsetChunks = 0;
 
-static bool     g_chunkPainted[N_CHUNKS]    = {};
-static uint32_t g_chunkOriginTick[N_CHUNKS] = {};  
+// ── Rounded Notes shader ──────────────────────────────────────────────────
+static Shader   g_roundShader          = { 0 };
+static bool     g_roundShaderLoaded    = false;
+static bool     g_roundShaderOk        = false;
+static int      g_roundCapTexelsLoc    = -1;
+static int      g_roundTexelToPxXLoc   = -1;
+static int      g_roundRowHeightPxLoc  = -1;
+
+static constexpr int ROUND_CAP_TEXELS = 6;
+
+static void EnsureRoundedNoteShader() {
+    if (g_roundShaderLoaded) return;
+    g_roundShaderLoaded = true;
+
+    static const char* fs =
+        "#version 330\n"
+        "in vec2 fragTexCoord;\n"
+        "in vec4 fragColor;\n"
+        "uniform sampler2D texture0;\n"
+        "uniform vec4 colDiffuse;\n"
+        "uniform float capTexels;\n"        // ROUND_CAP_TEXELS
+        "uniform float texelToScreenPxX;\n" // screen px per source texel (horizontal)
+        "uniform float rowHeightPx;\n"      // screen px spanned by one MIDI pitch row
+        "out vec4 finalColor;\n"
+        "void main() {\n"
+        "    vec4 s = texture(texture0, fragTexCoord);\n"
+        "    float code = s.a * 255.0;\n"
+        "    if (code < 0.5) { finalColor = vec4(0.0); return; }\n" // background
+        "    if (code > 254.5) { finalColor = vec4(s.rgb, 1.0) * colDiffuse; return; }\n" // interior, far from any real edge
+        "    float band = floor((code - 1.0) / capTexels);\n"
+        "    float localCode = code - band * capTexels;\n"
+        "    float edgeDistX = (localCode - 1.0) * texelToScreenPxX;\n" // distance to the real edge, in screen px
+        "    float rowFrac = fract(fragTexCoord.y * 128.0);\n"          // 0..1 position within THIS pitch row's band
+        "    float edgeDistY;\n"
+        "    if (band < 0.5)      edgeDistY = min(rowFrac, 1.0 - rowFrac) * rowHeightPx;\n" // both edges relevant
+        "    else if (band < 1.5) edgeDistY = (1.0 - rowFrac) * rowHeightPx;\n"             // only bottom relevant
+        "    else                 edgeDistY = rowFrac * rowHeightPx;\n"                     // only top relevant
+        "    float R = min(rowHeightPx * 0.5, capTexels * texelToScreenPxX);\n"
+        "    if (edgeDistX >= R || edgeDistY >= R) { finalColor = vec4(s.rgb, 1.0) * colDiffuse; return; }\n" // flat body/seam, not in a corner box
+        "    vec2 q = vec2(R - edgeDistX, R - edgeDistY);\n" // position relative to the rounding circle's center
+        "    float dist = length(q);\n"
+        "    float alpha = 1.0 - smoothstep(R - 1.5, R + 1.5, dist);\n"
+        "    finalColor = vec4(s.rgb, alpha) * colDiffuse;\n"
+        "}\n";
+
+    g_roundShader = LoadShaderFromMemory(nullptr, fs);
+    g_roundShaderOk = (g_roundShader.id != 0);
+    if (g_roundShaderOk) {
+        g_roundCapTexelsLoc   = GetShaderLocation(g_roundShader, "capTexels");
+        g_roundTexelToPxXLoc  = GetShaderLocation(g_roundShader, "texelToScreenPxX");
+        g_roundRowHeightPxLoc = GetShaderLocation(g_roundShader, "rowHeightPx");
+    }
+}
+
+static bool     g_chunkPainted[MAX_CHUNKS]    = {};
+static uint32_t g_chunkOriginTick[MAX_CHUNKS] = {};  
 
 // Background thread paints one chunk at a time using immutable bounds
 struct ChunkJob { 
@@ -221,11 +283,22 @@ static std::mutex               g_paintMtx;
 static std::condition_variable  g_paintCV;
 static std::queue<ChunkJob>     g_paintQueue;
 static std::atomic<int>         g_lastPaintedChunk{ -1 };
+static std::atomic<int>         g_paintQueueDepth{ 0 }; // # of jobs waiting/in-flight, for progress reporting
 
-// Guards raw g_pixBuf memory itself (writes from the background paint
-// thread vs. reads from the main thread when uploading to the GPU texture).
-// g_paintMtx above only protects the job queue, NOT the pixel data, so it
-// is not sufficient on its own to prevent a torn read of g_pixBuf.
+// Must be called while already holding g_paintMtx. Drains the queue AND
+// resets the depth counter together so they can never drift apart. There
+// were previously several call sites that cleared g_paintQueue directly
+// (window-shift, seek, resize, InvalidateNoteBuffer) without touching
+// g_paintQueueDepth — each discarded-but-never-processed job leaked the
+// counter upward permanently, since BgPaintThreadFunc only decrements it
+// for jobs it actually pops and runs. That leak is what made the
+// "Streaming..." status get stuck true forever even at 4/4 chunks painted.
+// All queue-clear sites must go through this helper now.
+static inline void ClearPaintQueueLocked() {
+    while (!g_paintQueue.empty()) g_paintQueue.pop();
+    g_paintQueueDepth.store(0, std::memory_order_relaxed);
+}
+
 static std::mutex               g_pixBufMtx;
 
 static const std::vector<OptimizedTrackData>* g_tracks      = nullptr;
@@ -245,7 +318,7 @@ static inline uint32_t GetChunkStartTick(int c, uint32_t bufOrigin, uint64_t win
 }
 
 static inline uint32_t GetChunkEndTick(int c, uint32_t bufOrigin, uint64_t windowOffset) {
-    if (c < N_CHUNKS - 1) {
+    if (c < g_numChunks - 1) {
         return ExactChunkOrigin(bufOrigin, windowOffset + c + 1);
     }
     return ExactChunkOrigin(bufOrigin, windowOffset + c) + g_ticksPerChunk;
@@ -256,22 +329,9 @@ static std::atomic<bool> g_paintCancel{ false };
 
 // ---- helpers ---------------------------------------------------------------
 static inline uint32_t ToRGBA8(Color c) {
-    return (uint32_t)c.r | ((uint32_t)c.g << 8) | ((uint32_t)c.b << 16) | (0xFFu << 24);
+    return (uint32_t)c.r | ((uint32_t)c.g << 8) | ((uint32_t)c.b << 16) | ((uint32_t)c.a << 24);
 }
 inline Color GetTrackColorPFA(int track, int channel);
-
-// ===================================================================
-// FIX: Sliding Window Smooth Scroll & TickLayer Tracking Colors
-// Replace everything from "PaintChunkRange" exactly down to the end of
-// "DrawStreamingVisualizerNotes".
-// ===================================================================
-
-static uint64_t g_windowOffsetChunks = 0;
-
-struct RowSpan {
-    int x0, x1;
-    uint32_t rgba;
-};
 
 // ===================================================================
 // SEAMLESS CONTIGUOUS RENDERING & LOD OCCLUSION RASTERIZER
@@ -316,14 +376,25 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
         rowColors[y].assign(W, 0u);
     }
 
+    struct NoteRun { int px0, px1; bool clipLeft, clipRight; };
+    thread_local std::vector<NoteRun> rowRuns[128];
+    const bool roundNotes = g_enableRoundedNotes;
+    constexpr size_t ROUND_ROW_SAFETY_CAP = 4096;
+    if (roundNotes) {
+        for (int y = 0; y < 128; ++y) rowRuns[y].clear();
+    }
+
     uint64_t count = 0;
     int cancelCheckCounter = 0;
 
     if (g_bgViewerType == ViewerType::TickLayer) {
-        if (g_enableOverlapRemove) {
+        if (g_enableRenderOverlapRemove) {
             // ---- TICK LAYER (Overlap Remove Enabled): Heap-Optimized Reverse K-Way Merge ----
             thread_local std::vector<ReverseCursor> heap;
             heap.clear();
+
+            uint32_t pitchNextStart[128];
+            std::fill(std::begin(pitchNextStart), std::end(pitchNextStart), 0xFFFFFFFFu);
 
             for (size_t t = 0; t < g_tracks->size(); ++t) {
                 const auto& track = (*g_tracks)[t];
@@ -363,30 +434,41 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 const NoteEvent& n = *top.cur;
                 size_t t = top.trackIdx;
 
-                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
-                uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
-                uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
+                if (n.note < 128) {
+                    uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                    
+                    // Truncate based on the start tick of the next note on this pitch
+                    uint32_t clippedEnd = std::min(rawEnd, pitchNextStart[n.note]);
+                    
+                    pitchNextStart[n.note] = n.startTick;
 
-                if (ds < de) {
-                    int px0 = (int)((double)(ds - tickStart) * ppt);
-                    int px1 = (int)((double)(de - tickStart) * ppt);
-                    if (px1 > px0 + 1) px1--;
-                    if (px0 < 0)  px0 = 0;
-                    if (px1 > W)  px1 = W;
+                    if (n.startTick < clippedEnd) {
+                        uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
+                        uint32_t de = (clippedEnd < tickEnd)    ? clippedEnd  : tickEnd;
 
-                    if (px0 < px1) {
-                        int y = (PIX_H - 1) - (int)n.note;
-                        if ((unsigned)y < (unsigned)PIX_H) {
-                            Color col = GetTrackColorPFA((int)t, n.channel);
-                            uint32_t rgba = ToRGBA8(col);
+                        if (ds < de) {
+                            int px0 = (ds <= tickStart) ? 0 : (int)std::round((double)(ds - tickStart) * ppt);
+                            int px1 = (de >= tickEnd)   ? W : (int)std::round((double)(de - tickStart) * ppt);
 
-                            // Reverse Occlusion: write only if pixel is empty
-                            for (int px = px0; px < px1; ++px) {
-                                if (rowColors[y][px] == 0) {
-                                    rowColors[y][px] = rgba;
+                            if (px0 < 0) px0 = 0;
+                            if (px1 > W) px1 = W;
+                            if (px1 <= px0) px1 = px0 + 1;
+
+                            if (px0 < px1 && px0 < W) {
+                                if (px1 > W) px1 = W;
+                                int y = (PIX_H - 1) - (int)n.note;
+                                if ((unsigned)y < (unsigned)PIX_H) {
+                                    Color col = GetTrackColorPFA((int)t, n.channel);
+                                    uint32_t rgba = ToRGBA8(col);
+
+                                    std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
+                                    count++;
+
+                                    if (roundNotes && rowRuns[y].size() < ROUND_ROW_SAFETY_CAP) {
+                                        rowRuns[y].push_back({ px0, px1, n.startTick < tickStart, rawEnd > tickEnd });
+                                    }
                                 }
                             }
-                            count++;
                         }
                     }
                 }
@@ -440,19 +522,20 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
 
                 const NoteEvent& n = *top.cur;
                 size_t t = top.trackIdx;
-
                 uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
                 uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
                 uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
 
                 if (ds < de) {
-                    int px0 = (int)((double)(ds - tickStart) * ppt);
-                    int px1 = (int)((double)(de - tickStart) * ppt);
-                    if (px1 > px0 + 1) px1--;
-                    if (px0 < 0)  px0 = 0;
-                    if (px1 > W)  px1 = W;
+                    int px0 = (ds <= tickStart) ? 0 : (int)std::round((double)(ds - tickStart) * ppt);
+                    int px1 = (de >= tickEnd)   ? W : (int)std::round((double)(de - tickStart) * ppt);
 
-                    if (px0 < px1) {
+                    if (px0 < 0) px0 = 0;
+                    if (px1 > W) px1 = W;
+                    if (px1 <= px0) px1 = px0 + 1;
+
+                    if (px0 < px1 && px0 < W) {
+                        if (px1 > W) px1 = W;
                         int y = (PIX_H - 1) - (int)n.note;
                         if ((unsigned)y < (unsigned)PIX_H) {
                             Color col = GetTrackColorPFA((int)t, n.channel);
@@ -460,6 +543,10 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
 
                             std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
                             count++;
+
+                            if (roundNotes && rowRuns[y].size() < ROUND_ROW_SAFETY_CAP) {
+                                rowRuns[y].push_back({ px0, px1, n.startTick < tickStart, rawEnd > tickEnd });
+                            }
                         }
                     }
                 }
@@ -473,7 +560,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
         }
     }
     else {
-        // ---- TRACK LAYER: Track-Priority Layering (Domino Style) ----
+        // ---- TRACK LAYER: Track-Priority Layering ----
         for (size_t t = 0; t < g_tracks->size(); ++t) {
             if (g_paintCancel.load(std::memory_order_relaxed)) return;
             const auto& track = (*g_tracks)[t];
@@ -502,23 +589,105 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
                 uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
                 uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
-                if (ds >= de) continue;
 
-                int px0 = (int)((double)(ds - tickStart) * ppt);
-                int px1 = (int)((double)(de - tickStart) * ppt);
-                if (px1 > px0 + 1) px1--;
-                if (px0 < 0)  px0 = 0;
-                if (px1 > W)  px1 = W;
-                if (px0 >= px1) continue;
+                if (ds < de) {
+                    int px0 = (ds <= tickStart) ? 0 : (int)std::round((double)(ds - tickStart) * ppt);
+                    int px1 = (de >= tickEnd)   ? W : (int)std::round((double)(de - tickStart) * ppt);
 
-                int y = (PIX_H - 1) - (int)n.note;
-                if ((unsigned)y >= (unsigned)PIX_H) continue;
+                    if (px0 < 0) px0 = 0;
+                    if (px1 > W) px1 = W;
+                    if (px1 <= px0) px1 = px0 + 1;
 
-                Color col = GetTrackColorPFA((int)t, 0); 
-                uint32_t rgba = ToRGBA8(col);
+                    if (px0 < px1 && px0 < W) {
+                        if (px1 > W) px1 = W;
+                        int y = (PIX_H - 1) - (int)n.note;
+                        if ((unsigned)y < (unsigned)PIX_H) {
+                            Color col = GetTrackColorPFA((int)t, n.channel);
+                            uint32_t rgba = ToRGBA8(col);
 
-                std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
-                count++;
+                            std::fill_n(rowColors[y].data() + px0, px1 - px0, rgba);
+                            count++;
+
+                            if (roundNotes && rowRuns[y].size() < ROUND_ROW_SAFETY_CAP) {
+                                rowRuns[y].push_back({ px0, px1, n.startTick < tickStart, rawEnd > tickEnd });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Rounded Notes: encode real edge-distance into the alpha channel ---
+    if (roundNotes) {
+        struct RoundBlock { int px0, px1; bool leftClip, rightClip; };
+        thread_local std::vector<RoundBlock> rowBlocks[128];
+        for (int y = 0; y < PIX_H; ++y) rowBlocks[y].clear();
+
+        for (int y = 0; y < PIX_H; ++y) {
+            auto& runs = rowRuns[y];
+            if (runs.empty()) continue;
+            if (runs.size() > ROUND_ROW_SAFETY_CAP) continue; 
+            std::sort(runs.begin(), runs.end(),
+                [](const NoteRun& a, const NoteRun& b) { return a.px0 < b.px0; });
+
+            size_t i = 0;
+            while (i < runs.size()) {
+                size_t j = i;
+                int blockPx0 = runs[i].px0;
+                int blockPx1 = runs[i].px1;
+                bool leftClip = runs[i].clipLeft;
+                while (j + 1 < runs.size() && runs[j + 1].px0 <= blockPx1 + 1) {
+                    ++j;
+                    if (runs[j].px1 > blockPx1) blockPx1 = runs[j].px1;
+                }
+                bool rightClip = runs[j].clipRight;
+                rowBlocks[y].push_back({ blockPx0, blockPx1, leftClip, rightClip });
+                i = j + 1;
+            }
+        }
+        auto rowHasOverlap = [&](int y, int qpx0, int qpx1) -> bool {
+            if (y < 0 || y >= PIX_H) return false;
+            auto& blocks = rowBlocks[y];
+            if (blocks.empty()) return false;
+            auto it = std::upper_bound(blocks.begin(), blocks.end(), qpx1 - 1,
+                [](int value, const RoundBlock& b) { return value < b.px0; });
+            if (it == blocks.begin()) return false;
+            --it;
+            return it->px0 < qpx1 && it->px1 > qpx0;
+        };
+
+        for (int y = 0; y < PIX_H; ++y) {
+            for (auto& blk : rowBlocks[y]) {
+                if (blk.px1 <= blk.px0) continue;
+                uint32_t* row = rowColors[y].data();
+                int cap = std::min(ROUND_CAP_TEXELS, std::max(1, (blk.px1 - blk.px0) / 2));
+                if (!blk.leftClip) {
+                    bool topExp = !rowHasOverlap(y - 1, blk.px0, blk.px0 + cap);
+                    bool botExp = !rowHasOverlap(y + 1, blk.px0, blk.px0 + cap);
+                    if (topExp || botExp) {
+                        uint32_t band = (topExp && botExp) ? 0u : (botExp ? 1u : 2u);
+                        uint32_t bandBase = band * (uint32_t)ROUND_CAP_TEXELS;
+                        for (int k = 0; k < cap; ++k) {
+                            uint32_t rgb = row[blk.px0 + k] & 0x00FFFFFFu;
+                            uint32_t code = bandBase + (uint32_t)(k + 1);
+                            row[blk.px0 + k] = rgb | (code << 24);
+                        }
+                    }
+                }
+                if (!blk.rightClip) {
+                    bool topExp = !rowHasOverlap(y - 1, blk.px1 - cap, blk.px1);
+                    bool botExp = !rowHasOverlap(y + 1, blk.px1 - cap, blk.px1);
+                    if (topExp || botExp) {
+                        uint32_t band = (topExp && botExp) ? 0u : (botExp ? 1u : 2u);
+                        uint32_t bandBase = band * (uint32_t)ROUND_CAP_TEXELS;
+                        for (int k = 0; k < cap; ++k) {
+                            uint32_t rgb = row[blk.px1 - 1 - k] & 0x00FFFFFFu;
+                            uint32_t code = bandBase + (uint32_t)(k + 1);
+                            row[blk.px1 - 1 - k] = rgb | (code << 24);
+                        }
+                    }
+                }
             }
         }
     }
@@ -542,9 +711,10 @@ static void EnqueueChunk(int chunkIdx, uint32_t tickStart, uint32_t tickEnd, boo
 {
     std::lock_guard<std::mutex> lk(g_paintMtx);
     if (clearQueue) {
-        while (!g_paintQueue.empty()) g_paintQueue.pop();
+        ClearPaintQueueLocked();
     }
     g_paintQueue.push({ chunkIdx, tickStart, tickEnd });
+    g_paintQueueDepth.fetch_add(1, std::memory_order_relaxed);
     g_paintCV.notify_one();
 }
 
@@ -570,7 +740,31 @@ static void BgPaintThreadFunc()
             g_lastPaintedChunk.store(job.chunkIdx, std::memory_order_release);
         }
         g_paintBusy.store(false, std::memory_order_release);
+        g_paintQueueDepth.fetch_sub(1, std::memory_order_relaxed);
     }
+}
+
+// Real streaming/load progress of the background chunk-paint pipeline:
+// how many of the g_numChunks texture chunks are currently painted & valid,
+// plus whether the worker thread still has jobs in flight. This is the
+// actual "is PaintChunkRange caught up" signal — distinct from renderNotes/
+// maxRenderNotes, which only tracks note density within a single chunk.
+struct ChunkStreamStatus {
+    int  paintedChunks;
+    int  totalChunks;
+    bool streaming; // true while a chunk is being painted or queued
+    float progress; // 0..100
+};
+static ChunkStreamStatus GetChunkStreamStatus() {
+    ChunkStreamStatus s{};
+    s.totalChunks = g_numChunks;
+    int painted = 0;
+    for (int i = 0; i < g_numChunks; ++i) if (g_chunkPainted[i]) painted++;
+    s.paintedChunks = painted;
+    s.streaming = g_paintBusy.load(std::memory_order_relaxed) ||
+                  g_paintQueueDepth.load(std::memory_order_relaxed) > 0;
+    s.progress = s.totalChunks > 0 ? ((float)painted / (float)s.totalChunks) * 100.0f : 0.0f;
+    return s;
 }
 
 // ===================================================================
@@ -620,15 +814,20 @@ void DrawStreamingVisualizerNotes(
     const float  plx = (float)sw * 0.5f;
     const double ppt = (double)(sw - plx) / (double)viewWindow;
 
+    // Defensive clamp: g_numChunks is user-adjustable at runtime via the Options
+    // slider (2-16). Clamp here before it's used for any array indexing below —
+    // g_chunkPainted/g_chunkOriginTick are fixed at MAX_CHUNKS, so an out-of-range
+    // value (e.g. from a future JSON load) must never reach the indexing below.
+    g_numChunks = std::clamp(g_numChunks, 2, MAX_CHUNKS);
+
     // --- Strict Hardware Texture Cap Implementation ---
     constexpr int MAX_GPU_TEXTURE_WIDTH = 16384;
     int newChunkW = sw * 2;
-    if (newChunkW * N_CHUNKS > MAX_GPU_TEXTURE_WIDTH) {
-        newChunkW = MAX_GPU_TEXTURE_WIDTH / N_CHUNKS; // Clamps chunk to 4096 px (16384 px total)
+    if (newChunkW * g_numChunks > MAX_GPU_TEXTURE_WIDTH) {
+        newChunkW = MAX_GPU_TEXTURE_WIDTH / g_numChunks;
     }
-    const int newTexW = N_CHUNKS * newChunkW;
+    const int newTexW = g_numChunks * newChunkW;
 
-    // Calculate scale ratio between internal texture width and screen pixel width
     const float texScale = (float)newChunkW / (float)(sw * 2);
     const double scaledPpt = ppt * (double)texScale;
     const uint64_t newTicksPerChunk = (uint64_t)((double)newChunkW / scaledPpt) + 1;
@@ -636,13 +835,27 @@ void DrawStreamingVisualizerNotes(
     bool changed = (g_tex.id == 0 || g_texW != newTexW ||
         std::fabs(g_pixPerTick - scaledPpt) > 1e-9);
     if (changed) {
+        g_paintCancel.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(g_paintMtx);
+            ClearPaintQueueLocked();
+        }
+        while (g_paintBusy.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
         if (g_tex.id != 0) UnloadTexture(g_tex);
         g_chunkW = newChunkW;
         g_texW = newTexW;
         g_pixPerTick = scaledPpt;
         g_ticksPerChunk = newTicksPerChunk;
         g_ticksPerChunkExact = (double)newChunkW / scaledPpt;
-        g_pixBuf.assign((size_t)newTexW * PIX_H, 0u);
+        
+        {
+            std::lock_guard<std::mutex> lk(g_pixBufMtx);
+            g_pixBuf.assign((size_t)newTexW * PIX_H, 0u);
+        }
+
         Image img = {};
         img.data = g_pixBuf.data();
         img.width = newTexW;
@@ -651,7 +864,7 @@ void DrawStreamingVisualizerNotes(
         img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
         g_tex = LoadTextureFromImage(img);
         SetTextureFilter(g_tex, TEXTURE_FILTER_POINT);
-        for (int i = 0; i < N_CHUNKS; ++i) g_chunkPainted[i] = false;
+        for (int i = 0; i < g_numChunks; ++i) g_chunkPainted[i] = false;
         g_rtNeedsFullRedraw = true;
     }
 
@@ -665,188 +878,158 @@ void DrawStreamingVisualizerNotes(
 
     bool seeked = g_seekInvalidate.exchange(false);
 
-    // ---- On seek or init: CONTIGUOUS SEAMLESS RENDERING (100% Asynchronous) ----
-    if (seeked || g_rtNeedsFullRedraw) {
+    // Check if visible window is outside our rendered texture buffer bounds
+    bool outOfBounds = (leftTick < g_chunkOriginTick[0]) || 
+                       (leftTick >= g_chunkOriginTick[g_numChunks - 1]);
+
+    if (seeked || g_rtNeedsFullRedraw || outOfBounds) {
         g_rtNeedsFullRedraw = false;
 
+        // Cancel and wait for background paint thread to safely pause
+        g_paintCancel.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(g_paintMtx);
-            while (!g_paintQueue.empty()) g_paintQueue.pop();
+            ClearPaintQueueLocked();
         }
-        g_paintCancel.store(true, std::memory_order_release);
-
-        // Aborts background worker rapidly due to micro-interval cancel checks
         while (g_paintBusy.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
 
         g_windowOffsetChunks = 0;
-        g_bufOriginTick = (leftTick / g_ticksPerChunk) * g_ticksPerChunk;
-        for (int i = 0; i < N_CHUNKS; ++i) {
+        g_bufOriginTick = (uint32_t)leftTick;
+        for (int i = 0; i < g_numChunks; ++i) {
             g_chunkPainted[i] = false;
             g_chunkOriginTick[i] = ExactChunkOrigin(g_bufOriginTick, i);
-        }
-        int visibleChunk = 0;
-        for (int c = 0; c < N_CHUNKS; ++c) {
-            if (g_chunkOriginTick[c] <= leftTick) visibleChunk = c;
-            else break;
         }
 
         g_paintCancel.store(false, std::memory_order_release);
 
-        std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
-        UpdateTexture(g_tex, g_pixBuf.data());
+        {
+            std::lock_guard<std::mutex> lk(g_pixBufMtx);
+            std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
+        }
 
-        // Enqueue visible and future look-ahead chunks asynchronously
-        for (int nc = visibleChunk; nc < N_CHUNKS; ++nc) {
+        // Synchronously paint Chunk 0 on the main thread so visible notes appear instantly
+        uint32_t c0ts = GetChunkStartTick(0, g_bufOriginTick, 0);
+        uint32_t c0te = GetChunkEndTick(0, g_bufOriginTick, 0);
+        PaintChunkRange(0, c0ts, c0te);
+        g_chunkPainted[0] = true;
+
+        {
+            std::lock_guard<std::mutex> lk(g_pixBufMtx);
+            UpdateTexture(g_tex, g_pixBuf.data());
+        }
+
+        // Enqueue remaining lookahead chunks (1..g_numChunks-1) for background thread
+        for (int nc = 1; nc < g_numChunks; ++nc) {
             uint32_t cts = GetChunkStartTick(nc, g_bufOriginTick, 0);
             uint32_t cte = GetChunkEndTick(nc, g_bufOriginTick, 0);
             EnqueueChunk(nc, cts, cte, false);
         }
     }
     else {
+        // Upload finished chunks to GPU
         int lp = g_lastPaintedChunk.exchange(-1, std::memory_order_acquire);
         if (lp >= 0) {
             std::lock_guard<std::mutex> lk(g_pixBufMtx);
             UpdateTexture(g_tex, g_pixBuf.data());
         }
 
-        // SLIDING WINDOW SHIFT - Delay shift until the next buffer is fully painted
-        if (leftTick >= g_chunkOriginTick[1] && g_chunkPainted[1]) {
+        // ---- SMOOTH SLIDING WINDOW SHIFT ----
+        if (leftTick >= g_chunkOriginTick[1]) {
+            // Cancel background painter before modifying pixel memory
+            g_paintCancel.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(g_paintMtx);
-                while (!g_paintQueue.empty()) g_paintQueue.pop();
+                ClearPaintQueueLocked();
             }
-            g_paintCancel.store(true, std::memory_order_release);
-            while (g_paintBusy.load(std::memory_order_acquire)) { std::this_thread::yield(); }
-
-            for (int y = 0; y < PIX_H; ++y) {
-                uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW;
-                std::memmove(row, row + g_chunkW, (g_texW - g_chunkW) * sizeof(uint32_t));
-                std::memset(row + (g_texW - g_chunkW), 0, g_chunkW * sizeof(uint32_t));
+            while (g_paintBusy.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
             }
 
-            g_windowOffsetChunks++;
-            for (int i = 0; i < N_CHUNKS - 1; ++i) {
+            size_t shiftPx = g_chunkW;
+            size_t keepPx  = g_texW - shiftPx;
+
+            {
+                std::lock_guard<std::mutex> lk(g_pixBufMtx);
+                for (int y = 0; y < PIX_H; ++y) {
+                    uint32_t* row = g_pixBuf.data() + (size_t)y * g_texW;
+                    std::memmove(row, row + shiftPx, keepPx * sizeof(uint32_t));
+                    std::memset(row + keepPx, 0, shiftPx * sizeof(uint32_t));
+                }
+            }
+
+            g_bufOriginTick = g_chunkOriginTick[1];
+            for (int i = 0; i < g_numChunks - 1; ++i) {
                 g_chunkOriginTick[i] = g_chunkOriginTick[i + 1];
-                g_chunkPainted[i] = g_chunkPainted[i + 1];
+                g_chunkPainted[i]    = g_chunkPainted[i + 1];
             }
-            g_chunkOriginTick[N_CHUNKS - 1] = ExactChunkOrigin(g_bufOriginTick, g_windowOffsetChunks + N_CHUNKS - 1);
-            g_chunkPainted[N_CHUNKS - 1] = false;
+            g_chunkOriginTick[g_numChunks - 1] = ExactChunkOrigin(g_bufOriginTick, g_numChunks - 1);
+            g_chunkPainted[g_numChunks - 1]    = false;
 
             UpdateTexture(g_tex, g_pixBuf.data());
 
             g_paintCancel.store(false, std::memory_order_release);
-            for (int c = 0; c < N_CHUNKS; ++c) {
+
+            for (int c = 0; c < g_numChunks; ++c) {
                 if (!g_chunkPainted[c]) {
-                    uint32_t ts = GetChunkStartTick(c, g_bufOriginTick, g_windowOffsetChunks);
-                    uint32_t te = GetChunkEndTick(c, g_bufOriginTick, g_windowOffsetChunks);
+                    uint32_t ts = GetChunkStartTick(c, g_bufOriginTick, 0);
+                    uint32_t te = GetChunkEndTick(c, g_bufOriginTick, 0);
                     EnqueueChunk(c, ts, te, false);
-                }
-            }
-        }
-        else if (leftTick < g_chunkOriginTick[1]) {
-            // Panic Reset
-            uint64_t bufEnd = g_chunkOriginTick[N_CHUNKS - 1] + g_ticksPerChunk;
-            bool fellBehind = (leftTick < g_chunkOriginTick[0]) || ((uint64_t)sRight > bufEnd);
-            if (fellBehind) {
-                {
-                    std::lock_guard<std::mutex> lk(g_paintMtx);
-                    while (!g_paintQueue.empty()) g_paintQueue.pop();
-                }
-                g_paintCancel.store(true, std::memory_order_release);
-                while (g_paintBusy.load(std::memory_order_acquire)) { std::this_thread::yield(); }
-
-                g_windowOffsetChunks = 0;
-                g_bufOriginTick = (leftTick / g_ticksPerChunk) * g_ticksPerChunk;
-                for (int i = 0; i < N_CHUNKS; ++i) {
-                    g_chunkPainted[i] = false;
-                    g_chunkOriginTick[i] = ExactChunkOrigin(g_bufOriginTick, i);
-                }
-                int vc = 0;
-                for (int c = 0; c < N_CHUNKS; ++c) {
-                    if (g_chunkOriginTick[c] <= leftTick) vc = c;
-                    else break;
-                }
-
-                g_paintCancel.store(false, std::memory_order_release);
-                
-                std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
-                UpdateTexture(g_tex, g_pixBuf.data());
-
-                for (int nc = vc; nc < N_CHUNKS; ++nc) {
-                    uint32_t ts = GetChunkStartTick(nc, g_bufOriginTick, 0);
-                    uint32_t te = GetChunkEndTick(nc, g_bufOriginTick, 0);
-                    EnqueueChunk(nc, ts, te, false);
                 }
             }
         }
     }
 
-    // ---- Blit ----
+    // ---- UNIFIED SINGLE-PASS BLIT (Pixel-Perfect, No Stretching) ----
     {
-        float dstX = (sLeft < 0) ? (float)(-(double)sLeft * ppt) : 0.f;
-        float blitW = (float)sw - dstX;
-        if (blitW > 0.f) {
-            int64_t viewLeftTick = (sLeft >= 0) ? sLeft : 0;
-            int64_t viewRightTick = sRight;
+        float texRatio = (float)(g_pixPerTick / ppt);
 
-            // Determine visible chunk
-            int viewChunk = 0;
-            for (int c = N_CHUNKS - 1; c >= 0; --c) {
-                if ((int64_t)g_chunkOriginTick[c] <= viewLeftTick) {
-                    viewChunk = c; 
-                    break;
-                }
+        float dstX = 0.f;
+        float blitW = (float)sw;
+        double srcX = (double)(sLeft - (int64_t)g_bufOriginTick) * g_pixPerTick;
+
+        // At the start of playback (sLeft < 0), Tick 0 aligns at dstX on screen
+        if (sLeft < 0) {
+            dstX  = (float)(-(double)sLeft * ppt);
+            blitW = (float)sw - dstX;
+            srcX  = 0.0;
+        }
+
+        if (srcX < 0.0) srcX = 0.0;
+
+        // Scale texture sampling width to match visible screen width proportionally
+        float srcW = blitW * texRatio;
+
+        if (srcX + (double)srcW > (double)g_texW) {
+            srcW  = (float)((double)g_texW - srcX);
+            blitW = srcW / texRatio;
+        }
+
+        if (srcW > 0.f && blitW > 0.f) {
+            Rectangle srcRec = { (float)srcX, 0.f, srcW, (float)PIX_H };
+            Rectangle dstRec = { dstX, top, blitW, uh };
+
+            bool useRoundShader = false;
+            if (g_enableRoundedNotes) {
+                EnsureRoundedNoteShader();
+                useRoundShader = g_roundShaderOk;
             }
 
-            // Calculate active scaling factor for texture coordinates
-            float activeTexScale = (float)g_chunkW / (float)(sw * 2);
-
-            double intraChunkPx = (double)(viewLeftTick - (int64_t)g_chunkOriginTick[viewChunk]) * g_pixPerTick;
-            float srcX = (float)(viewChunk * g_chunkW) + (float)intraChunkPx;
-            if (srcX < 0.f) srcX = 0.f;
-
-            int rightChunk = viewChunk;
-            if (viewChunk + 1 < N_CHUNKS) {
-                if (viewRightTick > (int64_t)g_chunkOriginTick[viewChunk + 1]) {
-                    rightChunk = viewChunk + 1;
-                }
+            if (useRoundShader) {
+                float capTexels        = (float)ROUND_CAP_TEXELS;
+                float texelToScreenPxX = (srcRec.width > 0.f) ? (dstRec.width / srcRec.width) : 1.0f;
+                float rowHeightPx      = dstRec.height / (float)PIX_H;
+                SetShaderValue(g_roundShader, g_roundCapTexelsLoc,   &capTexels,        SHADER_UNIFORM_FLOAT);
+                SetShaderValue(g_roundShader, g_roundTexelToPxXLoc,  &texelToScreenPxX, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(g_roundShader, g_roundRowHeightPxLoc, &rowHeightPx,      SHADER_UNIFORM_FLOAT);
+                BeginShaderMode(g_roundShader);
             }
 
-            if (rightChunk == viewChunk) {
-                float screenW = blitW;
-                float texSrcW = screenW * activeTexScale;
-                if (srcX + texSrcW > (float)g_texW) {
-                    texSrcW = (float)g_texW - srcX;
-                    screenW = texSrcW / activeTexScale;
-                }
-                if (texSrcW > 0.f && screenW > 0.f) {
-                    DrawTexturePro(g_tex, { srcX, 0.f, texSrcW, (float)PIX_H }, { dstX, top, screenW, uh }, { 0,0 }, 0.f, WHITE);
-                }
-            }
-            else {
-                float chunk1EndSrcX = (float)((viewChunk + 1) * g_chunkW);
-                float texW1 = chunk1EndSrcX - srcX;
-                float screenW1 = texW1 / activeTexScale;
-                if (screenW1 > blitW) {
-                    screenW1 = blitW;
-                    texW1 = screenW1 * activeTexScale;
-                }
-                if (texW1 > 0.f && screenW1 > 0.f) {
-                    DrawTexturePro(g_tex, { srcX, 0.f, texW1, (float)PIX_H }, { dstX, top, screenW1, uh }, { 0,0 }, 0.f, WHITE);
-                }
+            DrawTexturePro(g_tex, srcRec, dstRec, { 0.f, 0.f }, 0.f, WHITE);
 
-                float srcX2 = (float)(rightChunk * g_chunkW);
-                float screenW2 = blitW - screenW1;
-                float texW2 = screenW2 * activeTexScale;
-                if (srcX2 + texW2 > (float)g_texW) {
-                    texW2 = (float)g_texW - srcX2;
-                    screenW2 = texW2 / activeTexScale;
-                }
-                if (texW2 > 0.f && screenW2 > 0.f) {
-                    DrawTexturePro(g_tex, { srcX2, 0.f, texW2, (float)PIX_H }, { dstX + screenW1, top, screenW2, uh }, { 0,0 }, 0.f, WHITE);
-                }
+            if (useRoundShader) {
+                EndShaderMode();
             }
         }
     }
@@ -889,7 +1072,6 @@ void DrawStreamingVisualizerNotes(
 }
 
 std::string FormatWithCommas(uint64_t value) {
-    // Build the string right-to-left into a fixed buffer to avoid repeated insertions
     char buf[32];
     int pos = 31;
     buf[pos] = '\0';
@@ -1004,7 +1186,6 @@ void NotificationManager::Draw() {
         DrawRectangleRounded(notificationRect, cornerRadius, 16, BGColor);
         float lineThickness = 2.0f;
         DrawRectangleRoundedLinesEx(notificationRect, cornerRadius, 16, lineThickness, Color {255,255,255,64});
-        // Cache wrapped text to avoid re-measuring every frame
         std::string cacheKey = notification.text + "|" + std::to_string((int)notification.width);
         auto cit = wrapCache.find(cacheKey);
         if (cit == wrapCache.end()) {
@@ -1084,22 +1265,18 @@ void SendNotification(float width, float height, Color backgroundColor, const st
 // ===================================================================
 
 void InvalidateNoteBuffer() {
-    // Cancel any in-progress paint job and drain the queue so the bg thread
-    // doesn't finish writing old chunk data AFTER we've already cleared and
-    // re-enqueued new chunks. Without this, old jobs corrupt new chunk pixels.
     g_paintCancel.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(g_paintMtx);
-        while (!g_paintQueue.empty()) g_paintQueue.pop();
+        ClearPaintQueueLocked();
     }
-    // Spin-wait for thread to finish its current PaintChunkRange call (~1 frame max)
     while (g_paintBusy.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     g_paintCancel.store(false, std::memory_order_release);
 
-    g_rtNeedsFullRedraw = true;   // force full texture repaint next frame
-    g_seekInvalidate.store(true); // also snap scroll position
+    g_rtNeedsFullRedraw = true;   
+    g_seekInvalidate.store(true); 
 }
 
 // ===================================================================
@@ -1108,24 +1285,18 @@ void InvalidateNoteBuffer() {
 #define MAX_TRACKS 65535
 
 static Color extendedColors[] = {
-    // Original 16 colors
     {51, 102, 255, 255}, {255, 102, 51, 255}, {51, 255, 102, 255}, {255, 51, 129, 255},
     {51, 255, 255, 255}, {228, 51, 255, 255}, {153, 255, 51, 255}, {75, 51, 255, 255},
     {255, 204, 51, 255}, {51, 180, 255, 255}, {255, 51, 51, 255}, {51, 255, 177, 255},
     {255, 51, 204, 255}, {78, 255, 51, 255}, {153, 51, 255, 255}, {231, 255, 51, 255},
-    // Additional colors (lighter variants)
     {102, 153, 255, 255}, {255, 153, 102, 255}, {102, 255, 153, 255}, {255, 102, 180, 255},
     {102, 255, 255, 255}, {255, 102, 255, 255}, {204, 255, 102, 255}, {126, 102, 255, 255},
-    // Additional colors (darker variants)
     {25, 51, 128, 255}, {128, 51, 25, 255}, {25, 128, 51, 255}, {128, 25, 64, 255},
     {25, 128, 128, 255}, {114, 25, 128, 255}, {76, 128, 25, 255}, {37, 25, 128, 255},
-    // More vibrant colors
     {255, 0, 127, 255}, {127, 255, 0, 255}, {0, 127, 255, 255}, {255, 127, 0, 255},
     {127, 0, 255, 255}, {0, 255, 127, 255}, {255, 255, 0, 255}, {0, 255, 255, 255},
-    // Pastel variants
     {255, 192, 203, 255}, {173, 216, 230, 255}, {144, 238, 144, 255}, {255, 182, 193, 255},
     {221, 160, 221, 255}, {176, 196, 222, 255}, {255, 160, 122, 255}, {152, 251, 152, 255},
-    // Final set
     {255, 105, 180, 255}, {64, 224, 208, 255}, {255, 215, 0, 255}, {138, 43, 226, 255},
     {50, 205, 50, 255}, {255, 69, 0, 255}, {30, 144, 255, 255}, {255, 20, 147, 255}
 };
@@ -1243,6 +1414,107 @@ bool LoadColorsFromPianoFromAbove() {
     return true;
 }
 
+// Helper: Convert HSV values to RGBA Color
+static Color ColorFromHSV(float hue, float saturation, float value) {
+    float c = value * saturation;
+    float x = c * (1.0f - std::fabs(std::fmod(hue / 60.0f, 2.0f) - 1.0f));
+    float m = value - c;
+    float r = 0, g = 0, b = 0;
+    if (hue >= 0 && hue < 60)        { r = c; g = x; b = 0; }
+    else if (hue >= 60 && hue < 120) { r = x; g = c; b = 0; }
+    else if (hue >= 120 && hue < 180){ r = 0; g = c; b = x; }
+    else if (hue >= 180 && hue < 240){ r = 0; g = x; b = c; }
+    else if (hue >= 240 && hue < 300){ r = x; g = 0; b = c; }
+    else                             { r = c; g = 0; b = x; }
+    return Color{
+        (unsigned char)((r + m) * 255),
+        (unsigned char)((g + m) * 255),
+        (unsigned char)((b + m) * 255),
+        255
+    };
+}
+
+// Generates default rainbow palettes inside AppData folder
+static void GenerateDefaultRainbowPalettes() {
+    std::string palettesDir = GetConfigPath("Palettes");
+    std::error_code ec;
+    std::filesystem::create_directories(palettesDir, ec);
+
+    auto makeRainbow = [&](const std::string& name, int w, int h) {
+        std::string outPath = palettesDir + "\\" + name;
+        if (std::filesystem::exists(outPath, ec)) return; 
+
+        Image img = GenImageColor(w, h, BLANK);
+        ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        Color* pixels = (Color*)img.data;
+
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                float hue = (x / (float)w) * 360.0f;
+                float sat = 1.0f - (y / (float)h) * 0.35f; 
+                float val = 0.65f + (y / (float)h) * 0.35f; 
+                pixels[y * w + x] = ColorFromHSV(hue, sat, val);
+            }
+        }
+
+        ExportImage(img, outPath.c_str());
+        UnloadImage(img);
+    };
+
+    makeRainbow("Rainbow_16x8.png", 16, 8);
+    makeRainbow("Rainbow_16x16.png", 16, 16);
+}
+
+// Loads a custom or preset image as track color mappings
+static bool LoadPaletteImage(const std::string& path) {
+    if (!FileExists(path.c_str())) {
+        SendNotification(360, 50, SERROR, "Palette file not found!", 3.0f);
+        return false;
+    }
+
+    Image img = LoadImage(path.c_str());
+    if (img.data == nullptr) {
+        SendNotification(360, 50, SERROR, "Failed to parse image data!", 3.0f);
+        return false;
+    }
+
+    ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    Color* pixels = (Color*)img.data;
+    int numPixels = img.width * img.height;
+
+    if (numPixels == 0) {
+        UnloadImage(img);
+        return false;
+    }
+
+    if (!colorsInitialized) {
+        InitializeTrackColors();
+    }
+
+    for (int i = 0; i < maxTracksUsed; i++) {
+        int track   = i / 16;
+        int channel = i % 16;
+
+        if (img.width == 16) {
+            if (img.height == 1) {
+                currentTrackColors[i] = pixels[(track + channel) % 16];
+            } else {
+                int px = channel;
+                int py = track % img.height;
+                currentTrackColors[i] = pixels[py * img.width + px];
+            }
+        } else {
+            currentTrackColors[i] = pixels[i % numPixels];
+        }
+    }
+
+    UnloadImage(img);
+    InvalidateNoteBuffer();
+    SendNotification(280, 50, SSUCCESS, "Color palette imported!", 3.0f);
+    std::cout << "+ Imported track colors from: " << path << " (" << img.width << "x" << img.height << ")" << std::endl;
+    return true;
+}
+
 // ===================================================================
 // INFORMATION VERSION
 // ===================================================================
@@ -1269,110 +1541,9 @@ bool DrawButton(Rectangle bounds, const char* text, Color colors) {
     return isHovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 
-bool DrawInputBox(Rectangle box, std::string &inputBuffer, int &cursorPos, bool &inputActive, int fontSize = 20, int padding = 5) {
-    DrawRectangle(0,0,GetScreenWidth(), GetScreenHeight(), Color {16,24,32,128});
-    DrawText("Input patch with '*.mid' file", GetScreenWidth() / 2 - MeasureText("Input patch with '*.mid' file", 20)/2, GetScreenHeight() - 100, 20, WHITE);
-    DrawText("This enter key be may because crash on after type.", GetScreenWidth() / 2 - MeasureText("This enter key be may because crash on after type.", 10)/2, GetScreenHeight() - 115, 10, RED);
-    DrawText("If you want put drop '*.mid' or '*.midi' file", GetScreenWidth() / 2 - MeasureText("If you want put drop '*.mid' or '*.midi' file", 10)/2, GetScreenHeight() - 130, 10, WHITE);
-    DrawRectangleRec(box, GRAY);
-    static double blinkTimer = 0.0;
-    blinkTimer += GetFrameTime();
-    bool showCursor = fmod(blinkTimer, 1.0) < 0.5;
-    int cursorPixelPos = MeasureText(inputBuffer.substr(0, cursorPos).c_str(), fontSize);
-    static int scrollOffset = 0;
-    if (cursorPixelPos - scrollOffset > (int)box.width - 2*padding) {
-        scrollOffset = cursorPixelPos - ((int)box.width - 2*padding);
-    }
-    if (cursorPixelPos - scrollOffset < 0) {
-        scrollOffset = cursorPixelPos;
-    }
-    std::string visibleText;
-    int visibleStart = 0;
-    for (int i = 0; i < (int)inputBuffer.size(); i++) {
-        int w = MeasureText(inputBuffer.substr(0, i+1).c_str(), fontSize);
-        if (w >= scrollOffset) {
-            visibleStart = i;
-            break;
-        }
-    }
-    for (int i = visibleStart; i < (int)inputBuffer.size(); i++) {
-        int w = MeasureText(inputBuffer.substr(visibleStart, i - visibleStart + 1).c_str(), fontSize);
-        if (w > (int)box.width - 2*padding) break;
-        visibleText = inputBuffer.substr(visibleStart, i - visibleStart + 1);
-    }
-    int textY = box.y + (box.height/2 - fontSize/2);
-    DrawText(visibleText.c_str(), box.x + padding, textY, fontSize, WHITE);
-    if (inputActive && showCursor) {
-        int beforeW = MeasureText(inputBuffer.substr(visibleStart, cursorPos - visibleStart).c_str(), fontSize);
-        int cursorX = box.x + padding + beforeW;
-        DrawLine(cursorX, box.y + 5, cursorX, box.y + box.height - 5, WHITE);
-    }
-    if (inputActive) {
-        int key = GetCharPressed();
-        while (key > 0) {
-            if (key >= 32 && key <= 125) {
-                inputBuffer.insert(cursorPos, 1, (char)key);
-                cursorPos++;
-                blinkTimer = 0.0;
-            }
-            key = GetCharPressed();
-        }
-        if (IsKeyPressed(KEY_BACKSPACE) && cursorPos > 0) {
-            inputBuffer.erase(cursorPos - 1, 1);
-            cursorPos--;
-            blinkTimer = 0.0;
-        }
-        if (IsKeyPressed(KEY_DELETE) && cursorPos < (int)inputBuffer.size()) {
-            inputBuffer.erase(cursorPos, 1);
-            blinkTimer = 0.0;
-        }
-        if (IsKeyPressed(KEY_LEFT) && cursorPos > 0) {
-            cursorPos--;
-            blinkTimer = 0.0;
-        }
-        if (IsKeyPressed(KEY_RIGHT) && cursorPos < (int)inputBuffer.size()) {
-            cursorPos++;
-            blinkTimer = 0.0;
-        }
-        if (IsKeyPressed(KEY_HOME)) {
-            cursorPos = 0;
-            blinkTimer = 0.0;
-        }
-        if (IsKeyPressed(KEY_END)) {
-            cursorPos = inputBuffer.size();
-            blinkTimer = 0.0;
-        }
-        if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_V)) {
-            const char* clip_cstr = GetClipboardText();
-            if (clip_cstr != nullptr) {
-                std::string clip_str(clip_cstr);             
-                if (!clip_str.empty()) {
-                    inputBuffer.insert(cursorPos, clip_str);
-                    cursorPos += clip_str.length(); 
-                    blinkTimer = 0.0;
-                }
-            }
-        }
-        if (IsKeyPressed(KEY_ENTER)) {
-            if (!inputBuffer.empty() && inputBuffer.front() == '"' && inputBuffer.back() == '"') {
-                inputBuffer = inputBuffer.substr(1, inputBuffer.size() - 2);
-            }
-            return true;
-        }
-        if (IsKeyPressed(KEY_ESCAPE)) {
-            inputBuffer.clear();
-            SendNotification(360, 50, SERROR, "Select input file cancelled", 5.0f);
-            inputActive = false;
-        }
-    }
-    return false;
-}
-
 void DrawModeSelectionMenu() {
     static std::string inputBuffer;
     static int cursorPos = 0;
-    static bool inputActive = false;
-    static bool showInputBox = false;
     if (IsFileDropped()) {
         FilePathList droppedFiles = LoadDroppedFiles();
         if (droppedFiles.count > 0) {
@@ -1389,29 +1560,23 @@ void DrawModeSelectionMenu() {
         }
         UnloadDroppedFiles(droppedFiles);
     }
-    if (IsKeyPressed(KEY_ENTER) && !inputActive) currentState = STATE_LOADING;
+    if (IsKeyPressed(KEY_ENTER)) currentState = STATE_LOADING;
     ClearBackground(JBG1A);
     DrawText("JIDI Player", 10, 10, 20, WHITE);
     DrawText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), GetScreenWidth()/2 - MeasureText(TextFormat("File: %s", GetFileName(selectedMidiFile.c_str())), 20)/2, 160, 20, LIGHTGRAY);
-    if (DrawButton({(float)GetScreenWidth() / 2 - 120, 200, 240, 50}, "Load midi input", JBG1B)) {
-        showInputBox = true;
-        inputActive = true;
+    if (DrawButton({(float)GetScreenWidth() / 2 - 120, 200, 240, 50}, "Load midi", JBG1B)) {
+        std::string chosen = OpenMidiFileDialog();
+        if (!chosen.empty()) {
+            selectedMidiFile = chosen;
+            inputBuffer = chosen;
+            cursorPos = (int)inputBuffer.length();
+            SendNotification(160, 50, SSUCCESS, "File loaded", 3.0f);
+        }
     }
     if (DrawButton({(float)GetScreenWidth() / 2 - 120, 265, 240, 50}, "Start Playback", JBG1B)) {
         currentState = STATE_LOADING;
     }
     InformationVersion();
-    if (showInputBox) {
-        Rectangle inputRect = { GetScreenWidth()/2 - 320.0f, GetScreenHeight() - 60.0f, 640.0f, 40 };
-        if (DrawInputBox(inputRect, inputBuffer, cursorPos, inputActive, 20)) {
-            selectedMidiFile = inputBuffer;
-            inputActive = false;
-            showInputBox = false;
-        }
-        if (!inputActive) {
-            showInputBox = false;
-        }
-    }
 }
 
 void DrawDetailedLoadingScreen() {
@@ -1423,7 +1588,6 @@ void DrawDetailedLoadingScreen() {
         percentage = (float)g_LoadProgress.bytesRead / (float)g_LoadProgress.totalBytes;
     }
 
-    // Draw Progress Bar
     int barW = 400;
     int barH = 20;
     int barX = GetScreenWidth() / 2 - barW / 2;
@@ -1431,7 +1595,6 @@ void DrawDetailedLoadingScreen() {
     DrawRectangle(barX, barY, barW, barH, DARKGRAY);
     DrawRectangle(barX, barY, (int)(barW * percentage), barH, LIME);
     
-    // Draw Stats
     int textY = 200;
     DrawText(TextFormat("Read Bytes: %zu / %zu", g_LoadProgress.bytesRead.load(), g_LoadProgress.totalBytes.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
     DrawText(TextFormat("Track: %d / %d", g_LoadProgress.currentTrack.load(), g_LoadProgress.totalTracks.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
@@ -1456,20 +1619,18 @@ static void BuildTempoSegs(int ppq) {
         if (ev.type != (uint8_t)EventType::TEMPO) continue;
         accumSec += (ev.tick - lastTick) * usPerTick / 1000000.0;
         lastTick  = ev.tick;
-        usPerTick = MidiTiming::CalculateMicrosecondsPerTick(ev.getTempo(), ppq); // Corrected here
+        usPerTick = MidiTiming::CalculateMicrosecondsPerTick(ev.getTempo(), ppq); 
         g_tempoSegs.push_back({ ev.tick, accumSec, usPerTick });
     }
 }
-// Bake the 20-cell NPS grid from all note tracks. Called once after load.
-// Each cell covers an equal time slice of the song; value = notes/sec in that slice.
-static double TicksToSeconds(uint64_t tick); // forward decl for BuildNpsGrid
+
+static double TicksToSeconds(uint64_t tick); 
 
 static void BuildNpsGrid(const std::vector<OptimizedTrackData>& tracks, int barWidthPx = 0) {
     g_npsGrid.clear();
     g_npsGridReady = false;
     if (g_songDurationSec <= 0.0 || g_tempoSegs.empty()) return;
 
-    // Cell count from bar width: fixed 10px per cell
     int cells = (barWidthPx > 0) ? std::max(1, barWidthPx / kNpsCellPx) : 126;
     g_npsGridCells      = cells;
     g_npsGridBuiltWidth = barWidthPx;
@@ -1508,10 +1669,6 @@ static double TicksToSeconds(uint64_t tick) {
     return seg.accumSec + (tick - seg.tick) * seg.usPerTick / 1000000.0;
 }
 
-// Returns the MIDI tick that is exactly 'seconds' of real time before targetTick,
-// properly walking the tempo map backward so BPM changes don't warp the window.
-// Used by the NPS calculation so the 1-second lookback window is always correct
-// even when the song crosses a tempo boundary inside that window.
 static uint32_t TicksMinusSeconds(uint64_t targetTick, double seconds) {
     if (g_tempoSegs.empty() || seconds <= 0.0) return 0;
 
@@ -1519,7 +1676,6 @@ static uint32_t TicksMinusSeconds(uint64_t targetTick, double seconds) {
     double windowStartSec = targetSec - seconds;
     if (windowStartSec <= 0.0) return 0;
 
-    // Binary-search for the tempo segment that contains windowStartSec
     size_t lo = 0, hi = g_tempoSegs.size();
     while (lo + 1 < hi) {
         size_t mid = (lo + hi) / 2;
@@ -1527,9 +1683,7 @@ static uint32_t TicksMinusSeconds(uint64_t targetTick, double seconds) {
         else hi = mid;
     }
     const auto& seg     = g_tempoSegs[lo];
-    double      remSec  = windowStartSec - seg.accumSec;   // seconds past seg start
-    // Convert remaining seconds back to ticks using this segment's usPerTick
-    // ticks = remSec / (usPerTick / 1e6) = remSec * 1e6 / usPerTick
+    double      remSec  = windowStartSec - seg.accumSec;   
     uint64_t resultTick = (seg.usPerTick > 0.0)
         ? (uint64_t)seg.tick + (uint64_t)(remSec * 1000000.0 / seg.usPerTick)
         : (uint64_t)seg.tick;
@@ -1576,55 +1730,87 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     currentY += lineHeight;
     DrawText(TextFormat("Scroll speed: %.2fx", scrollSpeed), (int)(panelX + padding), (int)currentY, 10, WHITE);
     currentY += lineHeight;
-    DrawText(TextFormat("Render notes: %llu / %llu (Textures)", renderNotes.load(), maxRenderNotes.load()), (int)(panelX + padding), (int)currentY, 10, WHITE);
+
+    uint64_t rnCur = renderNotes.load(std::memory_order_relaxed);
+    uint64_t rnMax = maxRenderNotes.load(std::memory_order_relaxed);
+    ChunkStreamStatus cs = GetChunkStreamStatus();
+    DrawText(TextFormat("Render notes: %llu / %llu ~ Chunks: %d / %d %s", rnCur, rnMax, cs.paintedChunks, cs.totalChunks, cs.streaming ? "(Streaming...)" : "(Ready)"), (int)(panelX + padding), (int)currentY, 10, WHITE);
+    currentY += lineHeight;
+    float barW = DWidth - padding * 2.0f;
+    float barH = 8.0f;
+	// Alright need to use rounded complete (1.0) bar here
+    DrawRectangle((int)(panelX + padding), (int)currentY, (int)barW, (int)barH, Color{0, 0, 0, 128});
+    float fillW = barW * std::clamp(cs.progress / 100.0f, 0.0f, 1.0f);
+    Color fillColor = cs.streaming ? YELLOW : (cs.progress >= 99.995f ? GREEN : ORANGE);
+    if (fillW > 0.0f) DrawRectangle((int)(panelX + padding), (int)currentY, (int)fillW, (int)barH, fillColor);
+    DrawRectangleLines((int)(panelX + padding), (int)currentY, (int)barW, (int)barH, Color{32, 32, 32, 200});
 }
 
 // ===================================================================
-// PERFORMANCE DEBUG (NEW)
+// PERFORMANCE DEBUG 
 // ===================================================================
 
 #define MAX_PERF_HISTORY 400
 
-static int perfFpsHistory[MAX_PERF_HISTORY] = {0};
+static int   perfFpsHistory[MAX_PERF_HISTORY] = {0};
 static float perfFtHistory[MAX_PERF_HISTORY] = {0.0f};
-static int perfTpsHistory[MAX_PERF_HISTORY] = {0};
+static int   perfTpsHistory[MAX_PERF_HISTORY] = {0};
 static float perfBufHistory[MAX_PERF_HISTORY] = {0.0f};
+static float perfRenderNotesHistory[MAX_PERF_HISTORY] = {0.0f}; // % complete (renderNotes / maxRenderNotes)
 
-// Rolling min / max / avg computed from the history window
 static int   perfFpsMin = 0, perfFpsMax = 0;
 static float perfFpsAvg = 0.0f;
 static float perfFtMin  = 0.0f, perfFtMax = 0.0f, perfFtAvg = 0.0f;
 static int   perfTpsMin = 0, perfTpsMax = 0;
 static float perfTpsAvg = 0.0f;
+static float perfRenderNotesMin = 0.0f, perfRenderNotesMax = 0.0f, perfRenderNotesAvg = 0.0f;
 static uint64_t perfEvpsHistory[MAX_PERF_HISTORY] = {0};
 static uint64_t perfEvpsMin = 0, perfEvpsMax = 0;
 static double   perfEvpsAvg = 0.0;
 static uint64_t lastCurrentVisualizerTick = 0;
 
-void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth, uint64_t evps) {
-    for (int i = 0; i < MAX_PERF_HISTORY - 1; i++) {
-        perfFpsHistory[i]  = perfFpsHistory[i + 1];
-        perfFtHistory[i]   = perfFtHistory[i + 1];
-        perfTpsHistory[i]  = perfTpsHistory[i + 1];
-        perfBufHistory[i]  = perfBufHistory[i + 1];
-        perfEvpsHistory[i] = perfEvpsHistory[i + 1];
-    }
-    perfFpsHistory[MAX_PERF_HISTORY - 1]  = fps;
-    perfFtHistory[MAX_PERF_HISTORY - 1]   = ft;
-    perfTpsHistory[MAX_PERF_HISTORY - 1]  = tps;
-    perfBufHistory[MAX_PERF_HISTORY - 1]  = bufHealth;
-    perfEvpsHistory[MAX_PERF_HISTORY - 1] = evps;
+// Ring buffer write cursor. Points at the most-recently-written (newest) slot.
+// Starts at MAX_PERF_HISTORY - 1 so the very first write lands on index 0.
+static int perfHistHead = MAX_PERF_HISTORY - 1;
+
+// Maps a logical "age" index (0 = oldest sample .. MAX_PERF_HISTORY-1 = newest sample)
+// to its physical slot in the ring buffer. Keeps every existing draw loop working
+// unmodified (they just index perfXHistory[i] in oldest->newest order via this helper).
+static inline int PerfIdx(int age) {
+    int idx = perfHistHead + 1 + age;
+    idx -= (idx >= MAX_PERF_HISTORY) ? MAX_PERF_HISTORY : 0;
+    return idx;
+}
+
+// Updates the rolling performance history. Previously this shifted all 5 history
+// arrays down by one element every single frame (5 * MAX_PERF_HISTORY memmoves/frame,
+// i.e. 2000 element copies/frame just to make room for 1 new sample). A ring buffer
+// turns that into a fixed set of O(1) writes; the min/max/avg scan below is the only
+// remaining O(MAX_PERF_HISTORY) work, and it's unavoidable for a sliding-window
+// min/max without a heavier structure (e.g. a monotonic deque), which isn't worth
+// the complexity at N = 400.
+void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth, uint64_t evps, float renderNotesPct) {
+    perfHistHead = (perfHistHead + 1 == MAX_PERF_HISTORY) ? 0 : perfHistHead + 1;
+
+    perfFpsHistory[perfHistHead]          = fps;
+    perfFtHistory[perfHistHead]           = ft;
+    perfTpsHistory[perfHistHead]          = tps;
+    perfBufHistory[perfHistHead]          = bufHealth;
+    perfEvpsHistory[perfHistHead]         = evps;
+    perfRenderNotesHistory[perfHistHead]  = renderNotesPct;
 
     int    fpsMin = perfFpsHistory[0], fpsMax = perfFpsHistory[0];
     float  ftMin  = perfFtHistory[0],  ftMax  = perfFtHistory[0];
     int    tpsMin = perfTpsHistory[0], tpsMax = perfTpsHistory[0];
     uint64_t evpsMin = perfEvpsHistory[0], evpsMax = perfEvpsHistory[0];
-    double fpsSum = 0.0, ftSum = 0.0, tpsSum = 0.0, evpsSum = 0.0;
+    float  rnMin  = perfRenderNotesHistory[0], rnMax = perfRenderNotesHistory[0];
+    double fpsSum = 0.0, ftSum = 0.0, tpsSum = 0.0, evpsSum = 0.0, rnSum = 0.0;
     for (int i = 0; i < MAX_PERF_HISTORY; i++) {
         fpsSum  += perfFpsHistory[i];
         ftSum   += perfFtHistory[i];
         tpsSum  += perfTpsHistory[i];
         evpsSum += (double)perfEvpsHistory[i];
+        rnSum   += perfRenderNotesHistory[i];
         if (perfFpsHistory[i]  < fpsMin)  fpsMin  = perfFpsHistory[i];
         if (perfFpsHistory[i]  > fpsMax)  fpsMax  = perfFpsHistory[i];
         if (perfFtHistory[i]   < ftMin)   ftMin   = perfFtHistory[i];
@@ -1633,23 +1819,24 @@ void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth, uint6
         if (perfTpsHistory[i]  > tpsMax)  tpsMax  = perfTpsHistory[i];
         if (perfEvpsHistory[i] < evpsMin) evpsMin = perfEvpsHistory[i];
         if (perfEvpsHistory[i] > evpsMax) evpsMax = perfEvpsHistory[i];
+        if (perfRenderNotesHistory[i] < rnMin) rnMin = perfRenderNotesHistory[i];
+        if (perfRenderNotesHistory[i] > rnMax) rnMax = perfRenderNotesHistory[i];
     }
     perfFpsMin = fpsMin; perfFpsMax = fpsMax; perfFpsAvg = (float)(fpsSum / MAX_PERF_HISTORY);
     perfFtMin  = ftMin;  perfFtMax  = ftMax;  perfFtAvg  = (float)(ftSum  / MAX_PERF_HISTORY);
     perfTpsMin = tpsMin; perfTpsMax = tpsMax; perfTpsAvg = (float)(tpsSum / MAX_PERF_HISTORY);
     perfEvpsMin = evpsMin; perfEvpsMax = evpsMax; perfEvpsAvg = evpsSum / MAX_PERF_HISTORY;
+    perfRenderNotesMin = rnMin; perfRenderNotesMax = rnMax; perfRenderNotesAvg = (float)(rnSum / MAX_PERF_HISTORY);
 }
 
 // ===================================================================
-// PERFORMANCE DEBUG PANEL (NEW)
+// PERFORMANCE DEBUG PANEL 
 // ===================================================================
 struct PerfTier {
     float threshold;
     Color color;
 };
 
-// Custom helper: Draws a fixed-height 1px vertical line that stacks two colors
-// to represent the progression percentage between the current tier and the next.
 void Draw100PercentStackedColumn(int x, int y, int height, float val, const std::vector<PerfTier>& tiers) {
     if (tiers.empty()) return;
     
@@ -1660,31 +1847,26 @@ void Draw100PercentStackedColumn(int x, int y, int height, float val, const std:
     
     float t0 = tiers[i].threshold;
     float t1 = tiers[i + 1].threshold;
-    Color cTop = tiers[i].color;     // Current Tier
-    Color cBottom = tiers[i + 1].color; // Next Tier
+    Color cTop = tiers[i].color;     
+    Color cBottom = tiers[i + 1].color; 
 
     float percent = 0.0f;
     if (t1 > t0) {
         percent = (val - t0) / (t1 - t0);
     }
     
-    // Clamp to [0.0, 1.0]
     if (percent < 0.0f) percent = 0.0f;
     if (percent > 1.0f) percent = 1.0f;
 
-    // Bottom portion represents progress towards the NEXT tier
     int bottomH = (int)(percent * (float)height);
     if (bottomH < 0) bottomH = 0;
     if (bottomH > height) bottomH = height;
     
-    // Top portion is the CURRENT tier
     int topH = height - bottomH;
 
-    // Draw the top remainder
     if (topH > 0) {
         DrawRectangle(x, y, 1, topH, cTop);
     }
-    // Draw the progressing bottom portion
     if (bottomH > 0) {
         DrawRectangle(x, y + topH, 1, bottomH, cBottom);
     }
@@ -1701,13 +1883,12 @@ void DrawPerformanceDebugPanel() {
     int cx = px + 10;
     int cy = py + 10;
 
-    const int GW = 400; // graph width (1px each)
-    const int GH = 45;  // graph height in pixels
+    const int GW = 400; 
+    const int GH = 45;  
 
     DrawText("Performance", cx, cy, 20, WHITE);
 	cy += 25;
 
-    // Tiers definitions mapping your thresholds from GetPerfColorList
     std::vector<PerfTier> fpsTiers = {
         {0.0f, BLACK}, {0.5f, PDarkerRed}, {1.0f, PDarkerRed}, {5.0f, PDarkRed}, {10.0f, PRed}, 
         {30.0f, POrange}, {60.0f, PYellow}, {240.0f, PGreen}, {960.0f, PBlue}, 
@@ -1734,31 +1915,28 @@ void DrawPerformanceDebugPanel() {
 		{100000000.0f, PWhite}
     };
 
-    // ---- FPS graph ----
-    DrawText(TextFormat("Graphics - Frames Per Second (Real-Time): %d  (%d / %d / %.0f)", perfFpsHistory[MAX_PERF_HISTORY - 1], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
+    DrawText(TextFormat("Graphics - Frames Per Second (Real-Time): %d  (%d / %d / %.0f)", perfFpsHistory[perfHistHead], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
     cy += 13;
 
     DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
     for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-        Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfFpsHistory[i], fpsTiers);
+        Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfFpsHistory[PerfIdx(i)], fpsTiers);
     }
 
-    // ---- Frame Time graph ----
     cy += GH + 5;
-    DrawText(TextFormat("Graphics - Frame Time: %.2f ms  (%.2f ms / %.2f ms / %.2f ms)", perfFtHistory[MAX_PERF_HISTORY - 1], perfFtMin, perfFtMax, perfFtAvg), cx, cy, 10, WHITE);
+    DrawText(TextFormat("Graphics - Frame Time: %.2f ms  (%.2f ms / %.2f ms / %.2f ms)", perfFtHistory[perfHistHead], perfFtMin, perfFtMax, perfFtAvg), cx, cy, 10, WHITE);
     cy += 13;
 
     DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
     for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-        Draw100PercentStackedColumn(cx + i, cy, GH, perfFtHistory[i], ftTiers);
+        Draw100PercentStackedColumn(cx + i, cy, GH, perfFtHistory[PerfIdx(i)], ftTiers);
     }
 
-    // ---- Bottom graph: TPS or Buffer Health ----
     cy += GH + 5;
     
     if (g_BassEngine.IsInitialized() && g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender) {
         auto prSt = g_BassEngine.GetPreRenderStatus();
-        float curHealth = perfBufHistory[MAX_PERF_HISTORY - 1];
+        float curHealth = perfBufHistory[perfHistHead];
         float maxHealth = g_BassEngine.GetConfig().preRenderBufferSec;
         {
             const BassConfig& cfg = g_BassEngine.GetConfig();
@@ -1778,20 +1956,20 @@ void DrawPerformanceDebugPanel() {
         cy += 13;
         DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
         for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-            Draw100PercentStackedColumn(cx + i, cy, GH, perfBufHistory[i], bufTiers);
+            Draw100PercentStackedColumn(cx + i, cy, GH, perfBufHistory[PerfIdx(i)], bufTiers);
         }
     } else {
-        DrawText(TextFormat("MIDI - Ticks Per Second: %d  (%d / %d / %.0f)", perfTpsHistory[MAX_PERF_HISTORY - 1], perfTpsMin, perfTpsMax, perfTpsAvg), cx, cy, 10, WHITE);
+        DrawText(TextFormat("MIDI - Ticks Per Second: %d  (%d / %d / %.0f)", perfTpsHistory[perfHistHead], perfTpsMin, perfTpsMax, perfTpsAvg), cx, cy, 10, WHITE);
         cy += 13;
         DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
         for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfTpsHistory[i], tpsTiers);
+            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfTpsHistory[PerfIdx(i)], tpsTiers);
         }
     }
 	cy += GH + 5;
 	bool evpsRecordingOn = g_AudioEngine.IsEventCounterRecordEnabled();
 	if (evpsRecordingOn) {
-		DrawText(TextFormat("MIDI - Events Per Second: %llu  (%llu / %llu / %.0f)", perfEvpsHistory[MAX_PERF_HISTORY - 1], perfEvpsMin, perfEvpsMax, perfEvpsAvg), cx, cy, 10, WHITE);
+		DrawText(TextFormat("MIDI - Events Per Second: %llu  (%llu / %llu / %.0f)", perfEvpsHistory[perfHistHead], perfEvpsMin, perfEvpsMax, perfEvpsAvg), cx, cy, 10, WHITE);
 	} else {
 		DrawText("MIDI - Events Per Second: [ DISABLED ]", cx, cy, 10, WHITE);
 	}
@@ -1799,7 +1977,7 @@ void DrawPerformanceDebugPanel() {
     if (evpsRecordingOn) {
         DrawRectangle(cx, cy, GW, GH, Color{0, 0, 0, 128});
         for (int i = 0; i < MAX_PERF_HISTORY; i++) {
-            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfEvpsHistory[i], evpsTiers);
+            Draw100PercentStackedColumn(cx + i, cy, GH, (float)perfEvpsHistory[PerfIdx(i)], evpsTiers);
         }
     } else {
         DrawRectangle(cx, cy, GW, GH, Color{64, 64, 64, 128});
@@ -1816,33 +1994,28 @@ static void SpawnParticle(BgParticle& p, bool randomX) {
     int sh = std::max(GetScreenHeight(), 1);
     p.x           = randomX ? (float)(rand() % sw) : (float)(sw + rand() % 300);
     p.y           = (float)(rand() % sh);
-    p.speedFactor = 0.5f + (rand() % 1000) / 1000.0f; // [0.50 – 1.50]
+    p.speedFactor = 0.5f + (rand() % 1000) / 1000.0f; 
     p.sizeFactor  = 0.5f + (rand() % 1000) / 1000.0f;
 }
 
-// bpmFactor  = (currentBpm / 120.0f) * MidiSpeed  when g_particleBpm is on
-//            = 1.0f                                when g_particleBpm is off
-// paused     = true  -> every particle freezes in place (speed = 0)
 static void UpdateAndDrawParticles(float dt, float bpmFactor, bool paused) {
     if (!g_particleShow) return;
 
-    // Resize pool on-the-fly when count changes
     int count = std::clamp(g_particleCount, 1, 512);
     int old   = (int)g_particles.size();
     if (old != count) {
         g_particles.resize(count);
         for (int i = old; i < count; ++i)
-            SpawnParticle(g_particles[i], /*randomX=*/true);
+            SpawnParticle(g_particles[i], true);
     }
 
-    // Pause = hard freeze; BPM flag = whether bpmFactor modulates speed
     float speedBase = paused ? 0.0f
                      : g_particleSpeed * (g_particleBpm ? bpmFactor : 1.0f);
 
     for (auto& p : g_particles) {
         p.x -= speedBase * p.speedFactor * dt;
         if (p.x < -(g_particleSize * p.sizeFactor * 4.0f))
-            SpawnParticle(p, /*randomX=*/false);
+            SpawnParticle(p, false);
         DrawCircleV({ p.x, p.y }, g_particleSize * p.sizeFactor, g_particleColor);
     }
 }
@@ -1852,39 +2025,39 @@ static void UpdateAndDrawParticles(float dt, float bpmFactor, bool paused) {
 // ===================================================================
 int main(int argc, char* argv[]) {
     std::cout << "+ Starting..." << std::endl;
-    // KDMAPI is the default audio backend. If it fails we continue anyway —
-    // the user can switch to BassMIDI from the Audio Config panel at runtime.
+    PreInitAudioConfig();
     bool kdmapiOk = InitializeKDMAPIStream();
     if (kdmapiOk) std::cout << "+ KDMAPI Initialized!" << std::endl;
     else std::cout << "[warn] KDMAPI init failed - switch to BassMIDI in Audio Config." << std::endl;
     if (argc > 1) {
         selectedMidiFile = argv[1];
         std::cout << "+ File selection alived!" << std::endl;
-    }
+    }    
     std::cout << "+ Opening window..." << std::endl;
     SetTraceLogLevel(LOG_WARNING);
+    if (g_transparentWindow) {
+        SetConfigFlags(FLAG_WINDOW_TRANSPARENT);
+    }    
     InitWindow(1280, 720, "JIDI Player - v1.0.4 (Build: " TOSTRING(BUILD_NUMBER) ")");
-	auto ib = GetIconPNGBytes();
-	if (ib.data && ib.size > 0) {
-		Image icon = LoadImageFromMemory(".png", ib.data, ib.size);
-		if (icon.data) { SetWindowIcon(icon); UnloadImage(icon); }
-	}
+    auto ib = GetIconPNGBytes();
+    if (ib.data && ib.size > 0) {
+        Image icon = LoadImageFromMemory(".png", ib.data, ib.size);
+        if (icon.data) { SetWindowIcon(icon); UnloadImage(icon); }
+    }
     SetWindowMinSize(450, 240);
     SetWindowState(FLAG_VSYNC_HINT);
     SetExitKey(KEY_NULL);
-	PreInitAudioConfig();
-	if (g_BassEngine.Init(GetWindowHandle())) {
+    if (g_BassEngine.Init(GetWindowHandle())) {
         std::cout << "+ BassMIDI engine ready\n";
-        LoadAudioConfig();
     } else {
         std::cout << "[warn] BassMIDI engine init failed - pre-render unavailable.\n";
     }
+    LoadAudioConfig();
     rlImGuiSetup(true);
 	#ifdef _WIN32
     static std::string imguiPath = GetConfigPath("imgui.ini");
     ImGui::GetIO().IniFilename = imguiPath.c_str();
 	#endif
-	// ImGui Global Styles (my made this themes)
 	ImGuiStyle& style = ImGui::GetStyle();
 	style.WindowBorderSize = 3.0f;
 	style.WindowRounding = 12.0f;
@@ -1902,8 +2075,7 @@ int main(int argc, char* argv[]) {
 		.onSeek  = [](int64_t targetMicros) {
 		g_AudioEngine.SeekAbsolute((uint64_t)targetMicros);
 	},});
-    // eventList lives in load.cpp; access via GetGlobalMidiEvents()
-	uint32_t frameupdate = 0;
+    uint32_t frameupdate = 0;
     uint16_t ppq = 480;
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 	uint32_t g_totalTicks = 0;
@@ -1920,48 +2092,30 @@ int main(int argc, char* argv[]) {
                 break;
             }
             case STATE_LOADING: {
-				// START THE THREAD ONCE
 				static bool isThreadStarted = false;
-				
 				if (!isThreadStarted) {
 					isThreadStarted = true;
-					
-					// Safely reset the progress values
 					g_LoadProgress.Reset(); 
-					
-					// Launch thread
 					g_LoaderThread = std::thread([&]() {
 						int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal,
 						timeSigNumerator, timeSigDenominator, &g_LoadProgress, g_enableOverlapRemove);
-						
-						// Assign out variables carefully
 						ppq = (uint16_t)iPpq;
 						currentTempo = (uint32_t)iTempo;
-						
-						// Finish Up
 						MidiLoadUsage = GetMemoryUsage();
 						TotalLoadUsage = GetMemoryUsage();
-						
 						g_LoadProgress.isFinished = true;
 					});
 				}
-
-				// DRAW THE LOADING CHUNK (Runs 60FPS to keep OS happy)
-				BeginDrawing();
+                BeginDrawing();
 				DrawDetailedLoadingScreen();
 				g_NotificationManager.Update();
 				g_NotificationManager.Draw();
 				EndDrawing();
-				
-				// CHECK IF DONE
 				if (g_LoadProgress.isFinished) {
-					g_LoaderThread.join(); // Safely close the thread
-					isThreadStarted = false; // reset for next time
-					
-					// Execute post-load configurations synchronously on the main thread now
+					g_LoaderThread.join(); 
+					isThreadStarted = false; 
 					InitializeTrackColors(static_cast<int>(noteTracks.size()));
-					
 					g_sortedNoteStartTicks.clear();
 					g_sortedNoteStartTicks.reserve(noteTotal);
 					g_sortedNoteEndTicks.clear();
@@ -1969,32 +2123,29 @@ int main(int argc, char* argv[]) {
 					g_songLastTick = 0;
 					g_maxNps  = 0;
 					g_maxPoly = 0;
-					for (const auto& track : noteTracks)
+					for (const auto& track : noteTracks) {
 						for (const auto& note : track.notes) {
 							g_sortedNoteStartTicks.push_back(note.startTick);
 							g_sortedNoteEndTicks.push_back(note.endTick);
 							if (note.endTick > g_songLastTick) g_songLastTick = note.endTick;
 						}
-						
+                    }
 					std::sort(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end());
 					std::sort(g_sortedNoteEndTicks.begin(),   g_sortedNoteEndTicks.end());
 					BuildTempoSegs(ppq);
 					g_songDurationSec = TicksToSeconds(g_songLastTick);
-					BuildNpsGrid(noteTracks, (int)(GetScreenWidth() - 20)); // bake NPS grid at 10px/cell
-					
+					BuildNpsGrid(noteTracks, (int)(GetScreenWidth() - 20)); 
 					if (noteTracks.size() == 0) {
 						currentState = STATE_MENU;
 						SendNotification(400, 75, SERROR, "You need to load MIDI files first", 5.0f);
 						break;
 					}
-					
-				// Start playing immediately!
-                firstPause = true;
+				firstPause = true;
 				currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 				{
 					const auto& evs = GetGlobalMidiEvents();
 					if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
-						currentTempo = evs[0].getTempo(); // Corrected here
+						currentTempo = evs[0].getTempo(); 
 					g_AudioEngine.Start(evs, ppq, currentTempo);
 				}
                 g_AudioEngine.SetSpeed(MidiSpeed);
@@ -2036,7 +2187,7 @@ int main(int argc, char* argv[]) {
 				std::cout << "F3 = Show Information" << std::endl;
                 std::cout << "F4 = Show Performance" << std::endl;
                 std::cout << "F8 = Audio Config (Show Options only)" << std::endl;
-                std::cout << "F9 = Show Options (ImGui)" << std::endl;
+                std::cout << "F9 = Show Options (ImGui, See more settings)" << std::endl;
                 std::cout << "F10 = Toggle VSync" << std::endl;
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
                 std::cout << "M = Reset maximum counter" << std::endl << std::endl;
@@ -2051,7 +2202,8 @@ int main(int argc, char* argv[]) {
                 
                 SetWindowState(FLAG_WINDOW_RESIZABLE);
                 currentState = STATE_PLAYING;
-                SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
+                if (g_enableOverlapRemove) SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s (Overlap Removed)", GetFileName(selectedMidiFile.c_str())));
+                else SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
 				g_Smtc.UpdateMetadata(GetFileName(selectedMidiFile.c_str()), "JIDI-Player");
                 if (isFirstCheck) {SendNotification(420, 50, SINFORMATION, "Check terminal for show help control", 5.0f); isFirstCheck = false;}
 				}
@@ -2066,12 +2218,10 @@ int main(int argc, char* argv[]) {
 					InvalidateNoteBuffer(); 
 					g_AudioEngine.Stop();
 					currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-					{
-						const auto& evs = GetGlobalMidiEvents();
-						if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
-							currentTempo = evs[0].getTempo();
-						g_AudioEngine.Start(evs, ppq, currentTempo);
-					}
+					const auto& evs = GetGlobalMidiEvents();
+					if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
+						currentTempo = evs[0].getTempo();
+					g_AudioEngine.Start(evs, ppq, currentTempo);
 					g_AudioEngine.SetSpeed(MidiSpeed);
 					g_AudioEngine.SetLooping(isLoop);
 					if (!isLoop) std::cout << "- Playback Restarted" << std::endl;
@@ -2086,7 +2236,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (IsKeyPressed(KEY_BACKSPACE) && (!showOptions)) { 
                     std::cout << "- Returning menu..." << std::endl; 
-                    InvalidateNoteBuffer(); // reset texture for next song
+                    InvalidateNoteBuffer(); 
                     g_AudioEngine.Stop();
                     g_AudioEngine.ClearLoopPoints();
                     g_loopPointA = g_loopPointB = UINT64_MAX;
@@ -2113,6 +2263,7 @@ int main(int argc, char* argv[]) {
                             TextIsEqual(ext, ".MID") || TextIsEqual(ext, ".MIDI")) {
                             std::cout << "- Returning menu after file drop files" << std::endl; 
                             g_AudioEngine.Stop();
+                            InvalidateNoteBuffer();
                             SetWindowState(FLAG_VSYNC_HINT);
                             ClearWindowState(FLAG_WINDOW_RESIZABLE);
                             SetWindowSize(1280, 720);
@@ -2133,7 +2284,6 @@ int main(int argc, char* argv[]) {
                         } else if (TextIsEqual(ext, ".png") || TextIsEqual(ext, ".jpg") ||
                                    TextIsEqual(ext, ".jpeg") || TextIsEqual(ext, ".PNG") ||
                                    TextIsEqual(ext, ".JPG") || TextIsEqual(ext, ".JPEG")) {
-                            // Drop image -> set as background
                             if (g_bgImageTex.id != 0) { UnloadTexture(g_bgImageTex); g_bgImageTex = { 0 }; }
                             g_bgImageTex = LoadTexture(filePath.c_str());
                             if (g_bgImageTex.id != 0) {
@@ -2157,24 +2307,40 @@ int main(int argc, char* argv[]) {
                     if (IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) {
                         g_AudioEngine.Seek(-3'000'000);
                         std::cout << "- Seeked backward 3 seconds" << std::endl;
-                        g_seekInvalidate.store(true); // triggers full redraw next frame
+                        g_seekInvalidate.store(true); 
                     }
                     if (IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) {
                         g_AudioEngine.Seek(3'000'000);
                         std::cout << "+ Seeked forward 3 seconds" << std::endl;
                     }
                     if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) {
-                        MidiSpeed += 0.01f;
-                        g_AudioEngine.SetSpeed(MidiSpeed);
-                    }
-                    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
-                        MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
-                        g_AudioEngine.SetSpeed(MidiSpeed);
-                    }
-                    if (IsKeyPressed(KEY_S)) {
-                        MidiSpeed = 1.00f;
-                        g_AudioEngine.SetSpeed(MidiSpeed);
-                    }
+						if (!IsTempoOverride) {
+							MidiSpeed += 0.01f;
+							g_AudioEngine.SetSpeed(MidiSpeed);
+						} else {
+							TempoSet += 1.0f;
+							g_AudioEngine.SetTempoOverride(true, TempoSet);
+						}
+					}
+					if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) {
+						if (!IsTempoOverride) {
+							MidiSpeed = std::max(0.01f, MidiSpeed - 0.01f);
+							g_AudioEngine.SetSpeed(MidiSpeed);
+						} else {
+							TempoSet = std::max(20.0f, TempoSet - 1.0f);
+							g_AudioEngine.SetTempoOverride(true, TempoSet);
+						}
+					}
+					if (IsKeyPressed(KEY_S)) {
+						if (!IsTempoOverride) {
+							MidiSpeed = 1.00f;
+							g_AudioEngine.SetSpeed(MidiSpeed);
+						} else {
+							float baseBpm = (currentTempo > 0) ? (60000000.0f / (float)currentTempo) : 120.0f;
+							TempoSet = baseBpm;
+							g_AudioEngine.SetTempoOverride(true, TempoSet);
+						}
+					}
                     if (IsKeyPressed(KEY_V)) { 
                         showGuide = !showGuide; 
                         std::cout << "- Guide " << (showGuide ? "visible" : "invisible") << std::endl; }
@@ -2189,7 +2355,6 @@ int main(int argc, char* argv[]) {
                         isLoop = !isLoop;
                         g_AudioEngine.SetLooping(isLoop);
                         std::cout << "- Loops " << (isLoop ? "enabled" : "disabled") << std::endl; }
-                    // J = Set loop point A  /  K = Set loop point B
                     if (IsKeyPressed(KEY_J)) {
                         uint64_t rawTick = g_AudioEngine.GetCurrentTick();
                         g_loopPointA = g_loopSnapToBeats
@@ -2202,7 +2367,6 @@ int main(int argc, char* argv[]) {
                         uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
                         uint64_t beatNum = tpb > 0 ? g_loopPointA / tpb + 1 : 0;
                         std::cout << "- Loop A set at tick " << g_loopPointA << " (beat " << beatNum << ")" << std::endl;
-                        SendNotification(420, 50, SDEBUG, TextFormat("Loop A: beat %llu (tick %llu)", (uint64_t)beatNum, (uint64_t)g_loopPointA), 3.0f);
                     }
                     if (IsKeyPressed(KEY_K)) {
                         uint64_t rawTick = g_AudioEngine.GetCurrentTick();
@@ -2216,7 +2380,6 @@ int main(int argc, char* argv[]) {
                         uint64_t tpb = ppq > 0 ? (static_cast<uint64_t>(ppq)*4u)/(timeSigDenominator?timeSigDenominator:4u) : 1;
                         uint64_t beatNum = tpb > 0 ? g_loopPointB / tpb + 1 : 0;
                         std::cout << "- Loop B set at tick " << g_loopPointB << " (beat " << beatNum << ")" << std::endl;
-                        SendNotification(420, 50, SDEBUG, TextFormat("Loop B: beat %llu (tick %llu)", (uint64_t)beatNum, (uint64_t)g_loopPointB), 3.0f);
                     }
                     if (IsKeyPressed(KEY_E)) {
                         isAntiSlowdown = !isAntiSlowdown;
@@ -2263,7 +2426,7 @@ int main(int argc, char* argv[]) {
                     ToggleBorderlessWindowed();
                     SendNotification(320, 50, SDEBUG, "Toggle has now fullscreen!", 5.0f); }
                 if (IsKeyPressed(KEY_F3)) { showDebug = !showDebug; 
-                    std::cout << "- Debug " << (showDebug ? "enabled" : "disabled") << std::endl; }
+                    std::cout << "- Information " << (showDebug ? "enabled" : "disabled") << std::endl; }
 				if (IsKeyPressed(KEY_F4)) { showPerformance = !showPerformance; 
                     std::cout << "- Performance " << (showPerformance ? "enabled" : "disabled") << std::endl; }
 				if (IsKeyPressed(KEY_F9)) {
@@ -2276,6 +2439,8 @@ int main(int argc, char* argv[]) {
                 bool isFinished = g_AudioEngine.IsFinished();
                 uint64_t currentVisualizerTick = g_AudioEngine.GetCurrentTick();
                 uint32_t currentTempo = g_AudioEngine.GetCurrentTempo();
+
+                MidiSpeed = g_AudioEngine.GetPlaybackSpeed();
 				float dt = GetFrameTime();
 				uint64_t evps = (!isPaused && !isFinished) ? g_AudioEngine.GetEventsPerSecond() : 0;
 				int tps = 0;
@@ -2288,7 +2453,10 @@ int main(int argc, char* argv[]) {
                 lastCurrentVisualizerTick = currentVisualizerTick;
                 
                 float currentBufHealth = (float)g_BassEngine.GetBufferHealthSeconds();
-                UpdatePerformanceHistory(1 / GetFrameTime(), GetFrameTime() * 1000.0f, tps, currentBufHealth, evps);
+                uint64_t rnCur = renderNotes.load(std::memory_order_relaxed);
+                uint64_t rnMax = maxRenderNotes.load(std::memory_order_relaxed);
+                float renderNotesPct = rnMax > 0 ? ((float)rnCur / (float)rnMax) * 100.0f : 0.0f;
+                UpdatePerformanceHistory(1 / GetFrameTime(), GetFrameTime() * 1000.0f, tps, currentBufHealth, evps, renderNotesPct);
                 
                 static bool finishedPrinted = false;
                 if (isFinished && !finishedPrinted) {
@@ -2340,7 +2508,7 @@ int main(int argc, char* argv[]) {
 				float bpmFactor = (currentTempo > 0) ? (60000000.0f / (float)currentTempo / 120.0f) * MidiSpeed : MidiSpeed;
                 BeginDrawing();
                 ClearBackground(g_backgroundColor);
-				// ── Background Image ─────────────────────────────────────
+
                 if (g_bgImageShow && g_bgImageTex.id != 0) {
                     float sw = (float)GetRenderWidth();
                     float sh = (float)GetRenderHeight();
@@ -2401,10 +2569,10 @@ int main(int argc, char* argv[]) {
                     {
                         double bufHealth = g_BassEngine.GetBufferHealthSeconds();
                         double curSec    = TicksToSeconds(currentVisualizerTick);
-                        double ahead     = curSec + (bufHealth * MidiSpeed); // decode has reached this far
+                        double ahead     = curSec + (bufHealth * MidiSpeed); 
                         float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)(ahead / g_songDurationSec), 0.f, 1.f) : 0.f;
                         float greenX = barX + blueW;
-                        float greenW = (barW * aheadFrac) - blueW; // width between playhead and decode head
+                        float greenW = (barW * aheadFrac) - blueW; 
                         if (greenW > 0.f) {
                             BeginScissorMode((int)greenX, (int)barY, (int)greenW, (int)barH);
                             DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{96,192,96,128});
@@ -2414,13 +2582,13 @@ int main(int argc, char* argv[]) {
 					{
                         int curBarW = (int)barW;
                         if (g_npsGridBuiltWidth != curBarW && g_songDurationSec > 0.0)
-                            BuildNpsGrid(noteTracks, curBarW); // rebuild for new width
+                            BuildNpsGrid(noteTracks, curBarW); 
                     }
                     if (g_npsGridReady && g_npsGridCells > 0) {
                         const float cellW = (float)kNpsCellPx;
                         for (int i = 0; i < g_npsGridCells; ++i) {
                             float cellX   = barX + i * cellW;
-                            if (cellX + cellW > barX + barW) break; // don't overdraw
+                            if (cellX + cellW > barX + barW) break; 
                             uint8_t alpha = (uint8_t)(g_npsGrid[i] * 128.f);
                             if (alpha < 1) continue;
                             Color cellCol = {255, 255, 255, alpha};
@@ -2433,14 +2601,13 @@ int main(int argc, char* argv[]) {
                         Vector2 mp = GetMousePosition();
                         if (mp.x >= barX && mp.x <= barX + barW && mp.y >= barY && mp.y <= barY + barH) {
                             float    seekFrac = std::clamp((mp.x - barX) / barW, 0.f, 1.f);
-                            // Use time fraction directly — tick->seconds is non-linear with tempo changes
                             uint64_t seekUs = (uint64_t)((double)seekFrac * g_songDurationSec * 1'000'000.0);
                             g_AudioEngine.SeekAbsolute(seekUs);
                             InvalidateNoteBuffer();
                             lastCounterTick = UINT64_MAX;
                         }
                     }
-                } // end bottom progress bar scope
+                } 
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 23, 20, JLIGHTBLUE);
                 double curSec = TicksToSeconds(currentVisualizerTick);
                 double totSec = g_songDurationSec;
@@ -2463,50 +2630,54 @@ int main(int argc, char* argv[]) {
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
 				if (showOptions) {
-                    // ── Pin window to top-right, resize each frame so it hugs its content ──
                     ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - 372.0f, 40.0f), ImGuiCond_Always);
-                    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Always); // height = auto
-                    
+                    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Always); 
                     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
-                    
                     if (ImGui::Begin("Options [F9]", &showOptions, wflags)) {
-						// ── Playback ─────────────────────────────────────────────────────
 						if (ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
 				 
-							// Speed slider (0.01x – 10.0x)
-							if (ImGui::SliderFloat("Speed", &MidiSpeed, 0.01f, 10.0f, "%.2fx")) {
-								g_AudioEngine.SetSpeed(MidiSpeed);
+								if (ImGui::Checkbox("Enable Tempo Override", &IsTempoOverride)) {
+								float baseBpm = (currentTempo > 0) ? (60000000.0f / (float)currentTempo) : 120.0f;
+								if (IsTempoOverride) {
+									TempoSet = baseBpm * MidiSpeed;
+									g_AudioEngine.SetTempoOverride(true, TempoSet);
+								} else {
+									g_AudioEngine.SetTempoOverride(false, TempoSet);
+								}
 							}
+
+							if (!IsTempoOverride) {
+								if (ImGui::SliderFloat("Speed", &MidiSpeed, 0.01f, 10.0f, "%.3fx")) {
+									g_AudioEngine.SetSpeed(MidiSpeed);
+								}
+							} else {
+								float baseBpm = (currentTempo > 0) ? (60000000.0f / (float)currentTempo) : 120.0f;
+								if (ImGui::SliderFloat("Set Tempo (BPM)", &TempoSet, 20.0f, 512.0f, "%.3f BPM")) {
+									g_AudioEngine.SetTempoOverride(true, TempoSet);
+								}
+							}
+							ImGui::Separator();
 				 
-							// Loop checkbox
 							if (ImGui::Checkbox("Enable loop", &isLoop)) {
 								g_AudioEngine.SetLooping(isLoop);
 							}
-							ImGui::SameLine();
-							
-							// ── Loop A/B Point Controls ──────────────────────────────────────
-							ImGui::Separator();
 							ImGui::TextUnformatted("Loop A/B  (J = Set A, K = Set B)");
 
-							// ── Beat-snap toggle ─────────────────────────────────────────────
 							ImGui::Checkbox("Snap to beat", &g_loopSnapToBeats);
 							ImGui::SameLine();
 							ImGui::TextDisabled("(?)");
 							if (ImGui::IsItemHovered())
 								ImGui::SetTooltip("When enabled, A/B points snap to the nearest beat boundary.\nUse the offset fields below to fine-tune.");
 
-							// ── Compute ticks-per-beat for display ───────────────────────────
 							uint64_t tpbDisp = (ppq > 0)
 								? (static_cast<uint64_t>(ppq) * 4u) / (timeSigDenominator ? timeSigDenominator : 4u)
 								: 1u;
 							if (tpbDisp == 0) tpbDisp = 1;
 
-							// Current position in beats (1-based)
 							uint64_t curBeat = currentVisualizerTick / tpbDisp + 1;
 							ImGui::Text("Now: beat %llu  (tick %llu)", (uint64_t)curBeat,
 							            (uint64_t)currentVisualizerTick);
 
-							// ── Per-point beat offset ─────────────────────────────────────────
 							if (g_loopSnapToBeats) {
 								ImGui::SetNextItemWidth(90.0f);
 								ImGui::DragInt("Offset A##loopA", &g_loopBeatOffsetA, 1.0f, -256, 256, "%+d beat");
@@ -2523,7 +2694,6 @@ int main(int argc, char* argv[]) {
 
 							ImGui::Spacing();
 
-							// ── Set / Reset buttons ───────────────────────────────────────────
 							bool abActive = g_AudioEngine.HasLoopPoints();
 
 							auto applyLoopA = [&]() {
@@ -2561,7 +2731,6 @@ int main(int argc, char* argv[]) {
 								std::cout << "- Loop A/B cleared\n";
 							}
 
-							// ── A / B position display ────────────────────────────────────────
 							ImGui::Spacing();
 							if (g_loopPointA != UINT64_MAX) {
 								uint64_t beatA = g_loopPointA / tpbDisp + 1;
@@ -2579,7 +2748,6 @@ int main(int argc, char* argv[]) {
 								ImGui::TextDisabled("B: (not set)");
 							}
 
-							// ── Status line ───────────────────────────────────────────────────
 							if (abActive && isLoop)
 								ImGui::TextColored(ImVec4(0.2f,1.0f,0.4f,1.0f), "Loop A/B active");
 							else if (abActive && !isLoop)
@@ -2588,18 +2756,15 @@ int main(int argc, char* argv[]) {
 								ImGui::TextDisabled("A/B not set (full-song loop)");
 							ImGui::Separator();
 				 
-							// Event skip checkbox
 							if (ImGui::Checkbox("Toggle Event Skip", &isAntiSlowdown)) {
 								g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
 							}
 							ImGui::SameLine();
-								// Event counter record (Information only)
 								bool eventCounterRecordUI = g_AudioEngine.IsEventCounterRecordEnabled();
-								if (ImGui::Checkbox("Event counter record", &eventCounterRecordUI)) {
+								if (ImGui::Checkbox("Ev/s Show (Information only)", &eventCounterRecordUI)) {
 									g_AudioEngine.ToggleEventCounterRecord(eventCounterRecordUI);
 								}
 				 
-							// Seek buttons
 							ImGui::Spacing();
 							if (ImGui::Button("« -10s"))  g_AudioEngine.Seek(-10'000'000LL);
 							ImGui::SameLine();
@@ -2610,10 +2775,6 @@ int main(int argc, char* argv[]) {
 							if (ImGui::Button("+10s »"))  g_AudioEngine.Seek( 10'000'000LL);
 						}
 						
-						// Audio Config window (BassMIDI pre-render) -- toggled by F8
-						DrawAudioConfigPanel();
-						
-						// Lag Simulator -- hidden when BassMIDI audio mode is active
 						if (g_BassEngine.GetActiveMode() == AudioMode::KDMAPI)
 							DrawLagSimulatorPanel(g_AudioEngine);
 						else {
@@ -2621,37 +2782,35 @@ int main(int argc, char* argv[]) {
 							ImGui::TextDisabled("Lag Simulator disabled (BassMIDI mode active).");
 						}
 				 
-						// ── Render ───────────────────────────────────────────────────────
 						if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
 				 
-							// Scroll speed slider (0.05 – 4.0)
-							if (ImGui::SliderFloat("Scroll Speed", &ScrollSpeed, 0.05f, 4.0f, "%.2fx")) {
-								// ScrollSpeed is read directly by the renderer — no extra call needed
-							}
+							if (ImGui::SliderFloat("Scroll Speed", &ScrollSpeed, 0.05f, 4.0f, "%.2fx"))
 							ImGui::SameLine();
 							if (ImGui::Button("Reset scroll")) ScrollSpeed = 0.5f;
-				 
-							// Guide / Beats toggles
-							ImGui::Checkbox("Show Guide", &showGuide);
-							ImGui::SameLine();
-							ImGui::Checkbox("Show Beats", &showBeats);
-				 
-							// Beat subdivisions (only relevant when beats are on, But no change update)
-							if (showBeats) {
-								int subdiv = beatSubdivisions;
-								if (ImGui::SliderInt("Beat Subdivisions", &subdiv, 1, 16)) {
-									beatSubdivisions = subdiv;
-								}
-							}
 							
-							if (ImGui::Checkbox("Render Overlap Remove", &g_enableOverlapRemove)) {
+							if (ImGui::SliderInt("Render Chunks", &g_numChunks, 2, MAX_CHUNKS, "%d")) {
+								g_numChunks = std::clamp(g_numChunks, 2, MAX_CHUNKS);
 								InvalidateNoteBuffer();
 							}
 							if (ImGui::IsItemHovered()) {
-								ImGui::SetTooltip("Enable to filter overlaps during parsing.\nNote: Requires reloading the MIDI file to update counters, NPS, and Polyphony.");
+								ImGui::SetTooltip("How many texture chunks to keep painted ahead of playback (1 current + lookahead).\nHigher = smoother scrolling on fast songs, more background render work.\nChanging this repaints the whole buffer.");
 							}
 				 
-							// Layer selector: matches the T key toggle
+							ImGui::Checkbox("Show Guide", &showGuide);
+							ImGui::SameLine();
+							ImGui::Checkbox("Show Beats", &showBeats);
+							
+							if (ImGui::Checkbox("Complete Overlap Remove", &g_enableOverlapRemove)) {}
+                            if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Enable to filter overlaps during parsing.\nNote: Requires reloading the MIDI file to update counters, NPS, and Polyphony.");
+							}
+                            if (ImGui::Checkbox("Render Overlap Remove", &g_enableRenderOverlapRemove)) {
+								InvalidateNoteBuffer();
+							}
+							if (ImGui::Checkbox("Toggle Rounded Notes", &g_enableRoundedNotes)) {
+								InvalidateNoteBuffer();
+							}
+
 							int layerIdx = (g_viewerType == ViewerType::TickLayer) ? 1 : 0;
 							const char* layers[] = { "Track Layer", "Tick Layer" };
 							if (ImGui::Combo("Layer", &layerIdx, layers, IM_ARRAYSIZE(layers))) {
@@ -2660,7 +2819,6 @@ int main(int argc, char* argv[]) {
 							}
 						}
 				 
-						// ── Display ──────────────────────────────────────────────────────
 						if (ImGui::CollapsingHeader("Display")) {
 							ImGui::Text("Background Color");
 							if (ImGui::ColorEdit4("##BgColor", g_bgColorF,
@@ -2678,8 +2836,12 @@ int main(int argc, char* argv[]) {
 								g_bgColorF[3] = 1.0f;
 								g_backgroundColor = { 8, 8, 8, 255 };
 							}
+
+                            ImGui::Checkbox("Transparent Window", &g_transparentWindow);
+                            if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Enable Transparent Window, Be may requires restart application.");
+							}
 							
-							// ── Background Image Config ────────────────────────
 							ImGui::Separator();
 							ImGui::Text("Background Image");
 							ImGui::Checkbox("Show##BgImg", &g_bgImageShow);
@@ -2762,7 +2924,6 @@ int main(int argc, char* argv[]) {
 							ImGui::SameLine();
 							ImGui::Checkbox("Performance", &showPerformance);
 				 
-							// VSync
 							bool vsync = IsWindowState(FLAG_VSYNC_HINT);
 							if (ImGui::Checkbox("VSync", &vsync)) {
 								if (vsync) SetWindowState(FLAG_VSYNC_HINT);
@@ -2770,14 +2931,12 @@ int main(int argc, char* argv[]) {
 							}
 							ImGui::SameLine();
 				 
-							// Fullscreen (Can't work at checked after fullscreen worked)
 							bool fsNow = IsWindowFullscreen();
 							if (ImGui::Checkbox("Fullscreen", &fsNow)) {
 								ToggleBorderlessWindowed();
 							}
 						}
 				 
-						// ── Colors ───────────────────────────────────────────────────────
 						if (ImGui::CollapsingHeader("Colors")) {
 							if (ImGui::Button("Randomize"))      RandomizeTrackColors();
 							ImGui::SameLine();
@@ -2789,11 +2948,84 @@ int main(int argc, char* argv[]) {
 								if (!LoadColorsFromPianoFromAbove())
 									SendNotification(410, 50, SERROR, "PFA config not found!", 3.0f);
 							}
+
+                            ImGui::Separator();
+                            ImGui::TextUnformatted("Image Palettes");
+
+                            std::string palettesDir = GetConfigPath("Palettes");
+                            static bool directorySetupDone = false;
+                            if (!directorySetupDone) {
+                                GenerateDefaultRainbowPalettes();
+                                directorySetupDone = true;
+                            }
+
+                            static std::vector<std::string> s_paletteFiles;
+                            static float s_scanTimer = 5.0f; 
+                            s_scanTimer += GetFrameTime();
+                            if (s_scanTimer >= 5.0f) {
+                                s_scanTimer = 0.0f;
+                                s_paletteFiles.clear();
+                                std::error_code ec;
+                                if (std::filesystem::exists(palettesDir, ec)) {
+                                    for (const auto& entry : std::filesystem::directory_iterator(palettesDir, ec)) {
+                                        if (entry.is_regular_file(ec)) {
+                                            auto ext = entry.path().extension().string();
+                                            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp") {
+                                                s_paletteFiles.push_back(entry.path().filename().string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            static int s_selectedPaletteIdx = -1;
+                            if (!s_paletteFiles.empty()) {
+                                std::vector<const char*> items;
+                                for (const auto& f : s_paletteFiles) items.push_back(f.c_str());
+                                
+                                ImGui::SetNextItemWidth(220.0f);
+                                if (ImGui::Combo("Palette Presets", &s_selectedPaletteIdx, items.data(), (int)items.size())) {
+                                    if (s_selectedPaletteIdx >= 0 && s_selectedPaletteIdx < (int)s_paletteFiles.size()) {
+                                        std::string fullPath = palettesDir + "\\" + s_paletteFiles[s_selectedPaletteIdx];
+                                        LoadPaletteImage(fullPath);
+                                    }
+                                }
+                            } else {
+                                ImGui::TextDisabled("No preset files found in Palettes folder.");
+                            }
+
+                            if (ImGui::Button("Generate Rainbow Presets")) {
+                                GenerateDefaultRainbowPalettes();
+                                s_scanTimer = 5.0f; 
+                                SendNotification(280, 50, SSUCCESS, "Default files generated!", 3.0f);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Reload Palette Presets")) {
+                                s_scanTimer = 5.0f; 
+                                if (s_selectedPaletteIdx >= 0 && s_selectedPaletteIdx < (int)s_paletteFiles.size()) {
+                                    std::string reloadPath = palettesDir + "\\" + s_paletteFiles[s_selectedPaletteIdx];
+                                    LoadPaletteImage(reloadPath);
+                                } else {
+                                    SendNotification(250, 50, SINFORMATION, "Palettes reloaded!", 3.0f);
+                                }
+                            }
+
+                            ImGui::Spacing();
+                            static char s_customPalettePath[512] = "";
+                            ImGui::SetNextItemWidth(220.0f);
+                            ImGui::InputText("##CustomPalPath", s_customPalettePath, sizeof(s_customPalettePath));
+                            ImGui::SameLine();
+                            if (ImGui::Button("Import Custom File")) {
+                                if (strlen(s_customPalettePath) > 0) {
+                                    LoadPaletteImage(s_customPalettePath);
+                                }
+                            }
 						}
-					}
-					// add check "if save automatic after close" and "if load automatic after startup"
-					// add load setting and Forgot move to manual save ("Save setting")
+                    }
 					ImGui::End();
+				}
+				if (IsAudioConfigPanelOpen()) {
+					DrawAudioConfigPanel();
 				}
                 rlImGuiEnd();
                 EndDrawing();
@@ -2805,8 +3037,9 @@ int main(int argc, char* argv[]) {
 	SaveAudioConfig();
     g_AudioEngine.Stop();
     StopNoteRenderThread();
-    g_BassEngine.Shutdown();    // shut down BassMIDI / pre-render before KDMAPI
-    TerminateKDMAPIStream();    // KDMAPI last (nothing routes through it after above)
+    g_BassEngine.Shutdown();    
+    TerminateKDMAPIStream();    
+    if (g_roundShaderOk) { UnloadShader(g_roundShader); g_roundShaderOk = false; }
 	rlImGuiShutdown();
     CloseWindow();
     return 0;
