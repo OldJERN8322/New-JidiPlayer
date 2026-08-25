@@ -8,19 +8,11 @@
 #include <cstdint>
 #include <cstdio>
 
-// ---------------------------------------------------------------
-// Hard limits - default 65,536 | min 512 | max 134,217,728 (2^27)
-// ---------------------------------------------------------------
 static constexpr int64_t kLagSimMin     =         512;
 static constexpr int64_t kLagSimMax     = 134217728LL;
 static constexpr int64_t kLagSimDefault =       65536;
 
-// Persist across enable/disable toggles
 extern int64_t s_lagSimEps;
-
-// ---------------------------------------------------------------
-// Format a large integer with comma separators for readability
-// ---------------------------------------------------------------
 static void FormatEps(char* buf, size_t bufsz, int64_t v)
 {
     if (v == 0) { snprintf(buf, bufsz, "0"); return; }
@@ -39,20 +31,18 @@ static void FormatEps(char* buf, size_t bufsz, int64_t v)
 
 inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
 {
-    // ── Collapsing header ─────────────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.22f, 0.12f, 0.32f, 1.00f));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.32f, 0.18f, 0.46f, 1.00f));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.42f, 0.22f, 0.58f, 1.00f));
-    bool open = ImGui::CollapsingHeader("Lag Simulator");
+    bool open = ImGui::CollapsingHeader("Slowdown mode");
     ImGui::PopStyleColor(3);
     if (!open) return;
 
     ImGui::Indent(8.0f);
     ImGui::Spacing();
 
-    // ── Enable toggle ─────────────────────────────────────────
     bool enabled = (engine.GetSimulateEventsPerSecond() > 0);
-    if (ImGui::Checkbox("Enable Lag Simulation", &enabled))
+    if (ImGui::Checkbox("Enable slowdown mode", &enabled))
         engine.SetSimulateEventsPerSecond(enabled ? s_lagSimEps : 0);
 
     if (ImGui::IsItemHovered())
@@ -60,7 +50,6 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
             "Throttles MIDI output to N events/second.\n"
             "Inspired by PFA For legit run.");
 
-    // ---- SMOOTH RENDER CHECKBOX IMPLEMENTATION ----
     ImGui::SameLine();
     bool smooth = engine.GetLagSmoothRender();
     if (ImGui::Checkbox("Smooth Render", &smooth)) {
@@ -77,12 +66,8 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
     }
 
     ImGui::Spacing();
-
-    // ── Manual EPS input ──────────────────────────────────────
     static const int64_t kStep     =  1024;
-    static const int64_t kStepFast = 65536;
-
-    // Use a fixed smaller width, bypassing the label so it stops cutting off bounds! 
+    static const int64_t kStepFast = 65536; 
     ImGui::PushItemWidth(100.0f); 
     if (ImGui::InputScalar("##eps", ImGuiDataType_S64, &s_lagSimEps, &kStep, &kStepFast, "%lld")) {
         if (s_lagSimEps < kLagSimMin) s_lagSimEps = kLagSimMin;
@@ -102,7 +87,6 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
         ImGui::EndTooltip();
     }
 
-    // Explicitly draw the custom formatted labels to stop them from dropping off screen
     ImGui::SameLine();
     ImGui::Text("Events / sec");
 
@@ -112,8 +96,6 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
     ImGui::TextDisabled("(%s)", buf);
 
     ImGui::Spacing();
-
-    // ── Preset buttons ────────────────────────────────────────
     struct Preset { const char* label; int64_t eps; const char* tip; };
     static constexpr Preset kPresets[] = {
         { "Potato",   	512,         "Fishy usage." 						  				},
@@ -134,8 +116,6 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
 
     ImGui::TextDisabled("Presets:");
     ImGui::SameLine();
-    
-    // Dynamic text-wrapping engine so trailing buttons move automatically!
     ImGuiStyle& style = ImGui::GetStyle();
     float window_visible_x2 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
 
@@ -165,8 +145,6 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-
-    // ── Live lag indicator ────────────────────────────────────
     bool  lagging = engine.IsSimulateLagActive();
     float t       = (float)ImGui::GetTime();
 
@@ -189,10 +167,8 @@ inline void DrawLagSimulatorPanel(MidiOutputEngine& engine)
 
     ImGui::Spacing();
     
-    // TextDisabled doesn't have a wrapped equivalent, so we change the color 
-    // manually and use TextWrapped to ensure it fits safely
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Tip: low EPS (< 8,192) + Anti-Slowdown OFF = stuck notes during lag bursts.");
+    ImGui::TextWrapped("Tip: low EV/s (< 8,192) + Anti-Slowdown OFF = stuck notes during lag bursts.");
     ImGui::PopStyleColor();
 
     ImGui::Unindent(8.0f);

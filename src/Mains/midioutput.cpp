@@ -13,6 +13,9 @@ extern "C" {
 extern bool s_KdmapiVelIgnore;
 extern int  s_VelIgnore;
 
+// Maximum Note-Ons allowed to be dispatched per single tick slice to prevent KDMAPI overflow
+static constexpr int kMaxNoteOnsPerTick = 512;
+
 MidiOutputEngine::MidiOutputEngine() : 
     threadRunning(false), isPlaying(false), isPaused(false), isFinished(false), isLooping(false),
     eventList(nullptr), currentPpq(480), currentVisualizerTick(0), playbackSpeed(1.0f) {
@@ -43,11 +46,11 @@ void MidiOutputEngine::BuildTempoIndex() {
 }
 
 void MidiOutputEngine::ToggleAntiSlowdown(bool enabled) {
-    antiSlowdownEnabled = enabled;
+    antiSlowdownEnabled.store(enabled, std::memory_order_relaxed);
 }
 
 bool MidiOutputEngine::IsAntiSlowdownEnabled() const {
-    return antiSlowdownEnabled.load();
+    return antiSlowdownEnabled.load(std::memory_order_relaxed);
 }
 
 float MidiOutputEngine::GetPlaybackSpeed() const {
@@ -191,7 +194,8 @@ void MidiOutputEngine::Pause() {
         isPaused = true;
         SilenceAllChannelsWithoutCC();
 
-        if (g_BassEngine.IsInitialized() && g_BassEngine.GetActiveMode() != AudioMode::KDMAPI)
+        if (g_BassEngine.IsInitialized() &&
+            g_BassEngine.GetActiveMode() != AudioMode::KDMAPI)
             g_BassEngine.Pause();
     }
 }
@@ -544,21 +548,22 @@ void MidiOutputEngine::PlaybackThread() {
         const bool isPreRender = g_BassEngine.IsInitialized() &&
                                  g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender;
 
-        uint64_t elapsedVirtualMicros = 0;
-        if (isPreRender) {
-            elapsedVirtualMicros = g_BassEngine.GetPositionMicros();
-        } else {
-            std::chrono::steady_clock::time_point startSnapshot;
-            float speedSnapshot;
-            {
-                std::lock_guard<std::mutex> lock(timingMutex);
-                startSnapshot = playbackStartTime;
-                speedSnapshot = playbackSpeed.load();
-            }
+        std::chrono::steady_clock::time_point startSnapshot;
+        float speedSnapshot = 1.0f;
+        if (!isPreRender) {
+            std::lock_guard<std::mutex> lock(timingMutex);
+            startSnapshot = playbackStartTime;
+            speedSnapshot = playbackSpeed.load();
+        }
+
+        auto sampleElapsedVirtualMicros = [&]() -> uint64_t {
+            if (isPreRender) return g_BassEngine.GetPositionMicros();
             auto now = std::chrono::steady_clock::now();
             uint64_t elapsedRealMicros = std::chrono::duration_cast<std::chrono::microseconds>(now - startSnapshot).count();
-            elapsedVirtualMicros = (uint64_t)(elapsedRealMicros * speedSnapshot);
-        }
+            return (uint64_t)(elapsedRealMicros * speedSnapshot);
+        };
+
+        uint64_t elapsedVirtualMicros = sampleElapsedVirtualMicros();
 
         double microsSinceLastEvent = ((double)elapsedVirtualMicros > accumulatedMicroseconds)
             ? (double)elapsedVirtualMicros - accumulatedMicroseconds : 0.0;
@@ -583,22 +588,25 @@ void MidiOutputEngine::PlaybackThread() {
         }
 
         int processedInBatch = 0;
+        int noteOnsDispatchedThisTick = 0;
+        uint32_t currentTickBatch = lastProcessedTick;
         uint64_t dispatchAccumulator = 0;
+        const bool eventSkipEnabled = antiSlowdownEnabled.load(std::memory_order_relaxed);
+
         while (eventPos < eventList->size() && threadRunning && !isPaused) {
+            if ((processedInBatch & 0xFF) == 0) {
+                elapsedVirtualMicros = sampleElapsedVirtualMicros();
+            }
+
             const auto& event = (*eventList)[eventPos];
             if (hasLoopPoints.load() && isLooping.load()) {
                 if ((uint64_t)event.tick >= loopEndTick.load()) break;
             }
-            double scheduledTime = accumulatedMicroseconds + (event.tick - lastProcessedTick) * effectiveMicrosPerTick;    
+            double scheduledTime = accumulatedMicroseconds + (double)(event.tick - lastProcessedTick) * effectiveMicrosPerTick;    
+            
+            // If the event is in the future: yield instead of sleeping to prevent thread suspension
             if (scheduledTime > (double)elapsedVirtualMicros) {
-                double waitTimeMicros = scheduledTime - (double)elapsedVirtualMicros;
-                if (waitTimeMicros > 2500.0) {
-                    uint64_t sleepTime = (uint64_t)(waitTimeMicros - 1500.0);
-                    if (sleepTime > 5000) sleepTime = 5000; 
-                    std::this_thread::sleep_for(std::chrono::microseconds(sleepTime));
-                } else if (waitTimeMicros > 200.0) {
-                    std::this_thread::yield();
-                }
+                std::this_thread::yield();
                 break; 
             }
 
@@ -611,10 +619,21 @@ void MidiOutputEngine::PlaybackThread() {
                 simLagActive.store(false);
             }
 
+            // Track tick changes to reset per-tick burst cap
+            if (event.tick != currentTickBatch) {
+                currentTickBatch = event.tick;
+                noteOnsDispatchedThisTick = 0;
+            }
+
+            // Ultra-low latency threshold (1.0ms) OR per-tick Note-On burst limit
+            const bool isLate = eventSkipEnabled && (((double)elapsedVirtualMicros - scheduledTime) > 1000.0);
+            const bool burstCapHit = eventSkipEnabled && (noteOnsDispatchedThisTick >= kMaxNoteOnsPerTick);
+
             accumulatedMicroseconds = scheduledTime;
             lastProcessedTick = event.tick;
             processedInBatch++;
-            if (processedInBatch % 4096 == 0) {
+
+            if ((processedInBatch & 0x1FF) == 0) {
                 currentVisualizerTick = event.tick;
             }           
             if (event.type == (uint8_t)EventType::TEMPO) {
@@ -623,18 +642,25 @@ void MidiOutputEngine::PlaybackThread() {
                 effectiveMicrosPerTick = microsecondsPerTick;
                 ApplyTempoOverride();
             } else if (!isPreRender) {
-                if (event.type == (uint8_t)EventType::NOTE_OFF) {
-                    DispatchMidiOut((0x80 | event.channel) | (event.getNote() << 8) | (event.getVelocity() << 16));
-                    activeNotes[event.channel][event.getNote()] = false;
-                } else if (event.type == (uint8_t)EventType::NOTE_ON) {
+                if (event.type == (uint8_t)EventType::NOTE_ON) {
                     uint8_t ch = event.channel, n = event.getNote(), v = event.getVelocity();
                     if (s_KdmapiVelIgnore && v > 0 && v <= (uint8_t)s_VelIgnore) {
-                        activeNotes[ch][n] = false;
                         eventPos++;
                         continue;
                     }
-                    DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
-                    activeNotes[ch][n] = (v > 0);
+
+                    // KeyDiv Guard + Burst Cap + Lag Skip
+                    if (!isLate && !burstCapHit && !activeNotes[ch][n]) {
+                        DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
+                        activeNotes[ch][n] = (v > 0);
+                        noteOnsDispatchedThisTick++;
+                    }
+                } else if (event.type == (uint8_t)EventType::NOTE_OFF) {
+                    uint8_t ch = event.channel, n = event.getNote();
+                    if (activeNotes[ch][n]) {
+                        DispatchMidiOut((0x80 | ch) | (n << 8) | (event.getVelocity() << 16));
+                        activeNotes[ch][n] = false;
+                    }
                 } else if (event.type == (uint8_t)EventType::CC) {
                     DispatchMidiOut((0xB0 | event.channel) | (event.getCCController() << 8) | (event.getCCValue() << 16));
                 } else if (event.type == (uint8_t)EventType::PITCH_BEND) {
@@ -676,11 +702,7 @@ void MidiOutputEngine::PlaybackThread() {
                     LoopBackToTick(loopStartTick.load());
                     continue;
                 }
-                double realWaitUs = (loopEndMicros - (double)elapsedVirtualMicros) / std::max(0.01, (double)playbackSpeed.load());
-                if (realWaitUs > 800.0) {
-                    uint64_t sleepUs = std::min((uint64_t)(realWaitUs - 400.0), (uint64_t)2000);
-                    std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
-                }
+                std::this_thread::yield();
             }
         }
         if (eventPos >= eventList->size()) {

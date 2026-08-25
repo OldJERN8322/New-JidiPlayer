@@ -133,7 +133,7 @@ BgImageFit  g_bgImageFit       = BgImageFit::Fill;
 
 bool inputActive = false;
 bool isLoop = false;
-bool isAntiSlowdown = false;
+bool isEventSkip = false;
 
 // Global definition of lag simulation EPS
 int64_t s_lagSimEps = 65536;
@@ -1582,18 +1582,19 @@ void DrawModeSelectionMenu() {
 void DrawDetailedLoadingScreen() {
     ClearBackground(JGRAY);
     DrawText("Loading File...", GetScreenWidth() / 2 - MeasureText("Loading File...", 40) / 2, 80, 40, WHITE);
-    
     float percentage = 0.0f;
     if (g_LoadProgress.totalBytes > 0) {
         percentage = (float)g_LoadProgress.bytesRead / (float)g_LoadProgress.totalBytes;
     }
-
-    int barW = 400;
-    int barH = 20;
-    int barX = GetScreenWidth() / 2 - barW / 2;
-    int barY = 150;
-    DrawRectangle(barX, barY, barW, barH, DARKGRAY);
-    DrawRectangle(barX, barY, (int)(barW * percentage), barH, LIME);
+    float barW = 400.0f;
+    float barH = 20.0f;
+    float barX = GetScreenWidth() / 2.0f - barW / 2.0f;
+    float barY = 150.0f;
+	
+    DrawRectangleRounded({barX, barY, barW, barH}, 1.0f, 32, DARKGRAY);
+	BeginScissorMode(barX, barY, barW * percentage, barH);
+    DrawRectangleRounded({barX, barY, barW, barH}, 1.0f, 32, JLIGHTBLUE);
+	EndScissorMode();
     
     int textY = 200;
     DrawText(TextFormat("Read Bytes: %zu / %zu", g_LoadProgress.bytesRead.load(), g_LoadProgress.totalBytes.load()), barX, textY, 20, LIGHTGRAY); textY += 25;
@@ -1738,12 +1739,11 @@ void DrawDebugPanel(uint64_t currentVisualizerTick, int ppq, uint32_t currentTem
     currentY += lineHeight;
     float barW = DWidth - padding * 2.0f;
     float barH = 8.0f;
-	// Alright need to use rounded complete (1.0) bar here
-    DrawRectangle((int)(panelX + padding), (int)currentY, (int)barW, (int)barH, Color{0, 0, 0, 128});
+    DrawRectangleRounded({panelX + padding, currentY, barW, barH}, 1.0f, 16, Color{0, 0, 0, 128});
     float fillW = barW * std::clamp(cs.progress / 100.0f, 0.0f, 1.0f);
     Color fillColor = cs.streaming ? YELLOW : (cs.progress >= 99.995f ? GREEN : ORANGE);
-    if (fillW > 0.0f) DrawRectangle((int)(panelX + padding), (int)currentY, (int)fillW, (int)barH, fillColor);
-    DrawRectangleLines((int)(panelX + padding), (int)currentY, (int)barW, (int)barH, Color{32, 32, 32, 200});
+    if (fillW > 0.0f) DrawRectangleRounded({panelX + padding, currentY, fillW, barH}, 1.0f, 16, fillColor);
+    DrawRectangleRoundedLinesEx({panelX + padding, currentY, barW, barH}, 1.0f, 32, 1.0f, Color{32, 32, 32, 192});
 }
 
 // ===================================================================
@@ -2151,9 +2151,9 @@ int main(int argc, char* argv[]) {
                 g_AudioEngine.SetSpeed(MidiSpeed);
                 g_AudioEngine.SetLooping(isLoop);
                 g_AudioEngine.Pause();
-                std::cout << "+-[ Help controller ]-+" << std::endl << std::endl;
+                std::cout << "+ - [ Help controller ] - +" << std::endl << std::endl;
 
-                std::cout << "--[ Playback ]--" << std::endl;
+                std::cout << "- - [ Playback ] - -" << std::endl;
                 std::cout << "BACKSPACE = Return menu" << std::endl;
                 std::cout << "SPACE = Pause / Resume" << std::endl;
                 std::cout << "LEFT = Seek -3 seconds" << std::endl;
@@ -2167,7 +2167,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "K = End loop" << std::endl;
                 std::cout << "L = Enable loop (Or when midi is finish)" << std::endl << std::endl;
 
-                std::cout << "--[ Render ]--" << std::endl;
+                std::cout << "- - [ Render ] - -" << std::endl;
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
                 std::cout << "I = Faster scroll speeds (-0.05x)" << std::endl;
                 std::cout << "P = Reset scroll speeds (0.50x)" << std::endl;
@@ -2175,13 +2175,13 @@ int main(int argc, char* argv[]) {
                 std::cout << "V = Toggle guide" << std::endl;
                 std::cout << "B = Toggle beats" << std::endl << std::endl;
 
-                std::cout << "--[ Color ]--" << std::endl;
+                std::cout << "- - [ Color ] - -" << std::endl;
                 std::cout << "Keypad 1 = Randomize track colors" << std::endl;
                 std::cout << "Keypad 2 = Generate completely random colors" << std::endl;
                 std::cout << "Keypad 3 = Import Piano From Above colors" << std::endl;
                 std::cout << "Keypad 0 = Reset track colors to original" << std::endl << std::endl; 
 
-                std::cout << "--[ Misc ]--" << std::endl;
+                std::cout << "- - [ Misc ] - -" << std::endl;
 				std::cout << "F1 = Toggle HUD" << std::endl;
                 std::cout << "F2 = Take Screenshot" << std::endl;
 				std::cout << "F3 = Show Information" << std::endl;
@@ -2192,7 +2192,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "F11 = Toggle Fullscreen (Do not return menu for because broken)" << std::endl;
                 std::cout << "M = Reset maximum counter" << std::endl << std::endl;
 
-                std::cout << "+-[ Let's being! ]-+" << std::endl;
+                std::cout << "+ - [ Let's being! ] - +" << std::endl;
                 std::cout << "- Scroll speed default set: " << ScrollSpeed << "x" << std::endl;
                 std::cout << "+ Midi load:" << GetFileName(selectedMidiFile.c_str()) << std::endl;
                 std::cout << "+ Total notes: " << FormatWithCommas(noteTotal).c_str() << " ~ Total tracks: " << noteTracks.size() << std::endl;
@@ -2382,9 +2382,9 @@ int main(int argc, char* argv[]) {
                         std::cout << "- Loop B set at tick " << g_loopPointB << " (beat " << beatNum << ")" << std::endl;
                     }
                     if (IsKeyPressed(KEY_E)) {
-                        isAntiSlowdown = !isAntiSlowdown;
-                        g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
-                        std::cout << "- Anti-Slowdown " << (isAntiSlowdown ? "enabled" : "disabled") << std::endl; }
+                        isEventSkip = !isEventSkip;
+                        g_AudioEngine.ToggleAntiSlowdown(isEventSkip);
+                        std::cout << "- Anti-Slowdown " << (isEventSkip ? "enabled" : "disabled") << std::endl; }
                     if (IsKeyPressed(KEY_F1)) { 
                         isHUD = !isHUD; 
                         std::cout << "- HUD " << (isHUD ? "visible" : "invisible") << std::endl; }
@@ -2597,6 +2597,7 @@ int main(int argc, char* argv[]) {
                             EndScissorMode();
                         }
                     }
+					DrawRectangleRoundedLinesEx({barX, barY, barW, barH}, roundness, segments, 2.0f, Color{32,32,32,128});
 					if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !ImGui::GetIO().WantCaptureMouse) {
                         Vector2 mp = GetMousePosition();
                         if (mp.x >= barX && mp.x <= barX + barW && mp.y >= barY && mp.y <= barY + barH) {
@@ -2619,7 +2620,7 @@ int main(int argc, char* argv[]) {
                     FormatWithCommas(g_currentPoly).c_str(), FormatWithCommas(g_maxPoly).c_str()),
                     10, 65, 10, JLIGHTBLUE);
 				if (g_AudioEngine.GetSimulateEventsPerSecond() > 0) {
-                    DrawText("[Lag Simulate Mode]", 10, 79, 10, JLIGHTYELLOW);
+                    DrawText("[Slowdown Mode]", 10, 79, 10, JLIGHTYELLOW);
                 }
                 if (firstPause) DrawText("Press SPACEBAR to play", GetScreenWidth()/2 - MeasureText("Press SPACEBAR to play", 20)/2, 20, 20, YELLOW);
                 else if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
@@ -2647,9 +2648,13 @@ int main(int argc, char* argv[]) {
 							}
 
 							if (!IsTempoOverride) {
+								ImGui::PushItemWidth(180.0f);
 								if (ImGui::SliderFloat("Speed", &MidiSpeed, 0.01f, 10.0f, "%.3fx")) {
 									g_AudioEngine.SetSpeed(MidiSpeed);
 								}
+								ImGui::PopItemWidth();
+								ImGui::SameLine();
+								if (ImGui::Button("Reset")) { MidiSpeed = 1.0f; g_AudioEngine.SetSpeed(MidiSpeed); }
 							} else {
 								float baseBpm = (currentTempo > 0) ? (60000000.0f / (float)currentTempo) : 120.0f;
 								if (ImGui::SliderFloat("Set Tempo (BPM)", &TempoSet, 20.0f, 512.0f, "%.3f BPM")) {
@@ -2756,8 +2761,8 @@ int main(int argc, char* argv[]) {
 								ImGui::TextDisabled("A/B not set (full-song loop)");
 							ImGui::Separator();
 				 
-							if (ImGui::Checkbox("Toggle Event Skip", &isAntiSlowdown)) {
-								g_AudioEngine.ToggleAntiSlowdown(isAntiSlowdown);
+							if (ImGui::Checkbox("Toggle Event Skip", &isEventSkip)) {
+								g_AudioEngine.ToggleAntiSlowdown(isEventSkip);
 							}
 							ImGui::SameLine();
 								bool eventCounterRecordUI = g_AudioEngine.IsEventCounterRecordEnabled();
@@ -2783,10 +2788,11 @@ int main(int argc, char* argv[]) {
 						}
 				 
 						if (ImGui::CollapsingHeader("Render", ImGuiTreeNodeFlags_DefaultOpen)) {
-				 
+							ImGui::PushItemWidth(180.0f);
 							if (ImGui::SliderFloat("Scroll Speed", &ScrollSpeed, 0.05f, 4.0f, "%.2fx"))
+							ImGui::PopItemWidth();
 							ImGui::SameLine();
-							if (ImGui::Button("Reset scroll")) ScrollSpeed = 0.5f;
+							if (ImGui::Button("Reset##Render")) ScrollSpeed = 0.5f;
 							
 							if (ImGui::SliderInt("Render Chunks", &g_numChunks, 2, MAX_CHUNKS, "%d")) {
 								g_numChunks = std::clamp(g_numChunks, 2, MAX_CHUNKS);
@@ -2938,11 +2944,11 @@ int main(int argc, char* argv[]) {
 						}
 				 
 						if (ImGui::CollapsingHeader("Colors")) {
-							if (ImGui::Button("Randomize"))      RandomizeTrackColors();
+							if (ImGui::Button("Randomize")) RandomizeTrackColors();
 							ImGui::SameLine();
 							if (ImGui::Button("Generate Random")) GenerateRandomTrackColors();
 							ImGui::SameLine();
-							if (ImGui::Button("Default"))           ResetTrackColors();
+							if (ImGui::Button("Default##ColorNotes")) ResetTrackColors();
 				 
 							if (ImGui::Button("Import Piano From Above")) {
 								if (!LoadColorsFromPianoFromAbove())
@@ -3013,9 +3019,10 @@ int main(int argc, char* argv[]) {
                             ImGui::Spacing();
                             static char s_customPalettePath[512] = "";
                             ImGui::SetNextItemWidth(220.0f);
+							ImGui::Text("Patch Palettes");
                             ImGui::InputText("##CustomPalPath", s_customPalettePath, sizeof(s_customPalettePath));
                             ImGui::SameLine();
-                            if (ImGui::Button("Import Custom File")) {
+                            if (ImGui::Button("Import File")) {
                                 if (strlen(s_customPalettePath) > 0) {
                                     LoadPaletteImage(s_customPalettePath);
                                 }

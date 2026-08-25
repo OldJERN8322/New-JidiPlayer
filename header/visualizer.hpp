@@ -93,7 +93,7 @@ extern std::string inputBuffer;
 #define JBG1B          CLITERAL(Color){ 32, 48, 64, 255 }
 #define JBG1C          CLITERAL(Color){ 48, 64, 96, 255 }
 #define JLIGHTPINK     CLITERAL(Color){ 255, 192, 255, 255 }
-#define JLIGHTBLUE     CLITERAL(Color){ 192, 224, 255, 255 }
+#define JLIGHTBLUE     CLITERAL(Color){ 192, 228, 255, 255 }
 #define JLIGHTLIME     CLITERAL(Color){ 192, 255, 192, 255 }
 #define JLIGHTYELLOW   CLITERAL(Color){ 255, 255, 192, 255 }
 
