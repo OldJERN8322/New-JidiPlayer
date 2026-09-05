@@ -143,17 +143,14 @@ static uint64_t g_loopPointA    = UINT64_MAX;
 static uint64_t g_loopPointB    = UINT64_MAX;
 // Beat-snap for A/B: when enabled, J/K/Set-A/Set-B snap to the beat grid
 static bool g_loopSnapToBeats   = true;
-static int  g_loopBeatOffsetA   = 0;   // beat offset applied when setting A  (can be negative)
-static int  g_loopBeatOffsetB   = 0;   // beat offset applied when setting B
-// Convert a raw tick to a beat-snapped tick + integer beat offset
-// ppqIn = pulses-per-quarter-note; offsetBeats is added AFTER snapping to beat
+static int  g_loopBeatOffsetA   = 0;
+static int  g_loopBeatOffsetB   = 0;
 static uint64_t LoopSnapToBeat(uint64_t tick, int offsetBeats, uint16_t ppqIn,
                                 uint16_t denominator)
 {
     if (ppqIn == 0) return tick;
     uint64_t tpb = (static_cast<uint64_t>(ppqIn) * 4u) / (denominator ? denominator : 4u);
     if (tpb == 0) tpb = ppqIn;
-    // Round to nearest beat boundary (instead of floor, for better feel)
     uint64_t beat    = (tick + tpb / 2) / tpb;
     int64_t  target  = static_cast<int64_t>(beat) + offsetBeats;
     if (target < 0) target = 0;
@@ -186,12 +183,11 @@ static std::vector<VisualizerTempoSeg> g_tempoSegs;
 static uint64_t g_currentNps  = 0;    // NPS at current tick (updated each frame)
 static uint64_t g_maxNps      = 0;    // peak NPS seen so far this file
 
-// Bottom progress bar: 20-cell NPS grid baked once at load time
-static constexpr int   kNpsCellPx    = 10;       // fixed cell width in pixels
-static int             g_npsGridCells = 0;        // computed from bar width at load/resize
-static std::vector<float> g_npsGrid;              // normalized 0..1 per cell, dynamic size
-static bool            g_npsGridReady = false;
-static int             g_npsGridBuiltWidth = 0;   // bar width used when grid was last built
+// Bottom progress bar: NPS grid baked once at load time
+static constexpr int MASTER_NPS_BINS = 2048; // High enough fidelity for 4K displays
+static constexpr int kNpsCellPx      = 10;   // Cell width in pixels on the timeline bar
+static std::vector<float> g_masterNpsHist;   // Normalized 0.0f .. 1.0f
+static bool g_npsGridReady = false;
 static uint64_t g_currentPoly = 0;    // polyphony at current tick
 static uint64_t g_maxPoly     = 0;    // peak polyphony seen so far this file
 
@@ -201,9 +197,9 @@ static uint64_t g_maxPoly     = 0;    // peak polyphony seen so far this file
 
 static std::atomic<bool>  g_seekInvalidate{ false };
 static constexpr int      PIX_H     = 128;
-// Need save/load json here i guess
 static constexpr int      MAX_CHUNKS = 16; // hard cap = fixed array size backing g_numChunks
-static int                 g_numChunks = 6; // runtime-adjustable via Options > Render > "Render Chunks" (2-16)
+// Need save/load json here i guess
+static int                g_numChunks = 4; // runtime-adjustable via Options > Render > "Render Chunks" (2-16)
 
 static Texture2D             g_tex        = { 0 };
 static int                   g_texW       = 0;   // = g_numChunks * screenWidth
@@ -283,27 +279,14 @@ static std::mutex               g_paintMtx;
 static std::condition_variable  g_paintCV;
 static std::queue<ChunkJob>     g_paintQueue;
 static std::atomic<int>         g_lastPaintedChunk{ -1 };
-static std::atomic<int>         g_paintQueueDepth{ 0 }; // # of jobs waiting/in-flight, for progress reporting
-
-// Must be called while already holding g_paintMtx. Drains the queue AND
-// resets the depth counter together so they can never drift apart. There
-// were previously several call sites that cleared g_paintQueue directly
-// (window-shift, seek, resize, InvalidateNoteBuffer) without touching
-// g_paintQueueDepth — each discarded-but-never-processed job leaked the
-// counter upward permanently, since BgPaintThreadFunc only decrements it
-// for jobs it actually pops and runs. That leak is what made the
-// "Streaming..." status get stuck true forever even at 4/4 chunks painted.
-// All queue-clear sites must go through this helper now.
+static std::atomic<int>         g_paintQueueDepth{ 0 }; 
 static inline void ClearPaintQueueLocked() {
     while (!g_paintQueue.empty()) g_paintQueue.pop();
     g_paintQueueDepth.store(0, std::memory_order_relaxed);
 }
-
-static std::mutex               g_pixBufMtx;
-
+static std::mutex g_pixBufMtx;
 static const std::vector<OptimizedTrackData>* g_tracks      = nullptr;
-static ViewerType                              g_bgViewerType = ViewerType::TrackLayer;
-
+static ViewerType g_bgViewerType = ViewerType::TrackLayer;
 static bool     g_rtNeedsFullRedraw = true;
 static uint32_t g_ticksPerChunk     = 0;  
 static double   g_ticksPerChunkExact = 0.0; 
@@ -311,12 +294,9 @@ static double   g_ticksPerChunkExact = 0.0;
 static inline uint32_t ExactChunkOrigin(uint32_t bufOrigin, int c) {
     return bufOrigin + (uint32_t)std::round((double)c * g_ticksPerChunkExact);
 }
-
-// Contiguous chunk boundaries helper functions
 static inline uint32_t GetChunkStartTick(int c, uint32_t bufOrigin, uint64_t windowOffset) {
     return ExactChunkOrigin(bufOrigin, windowOffset + c);
 }
-
 static inline uint32_t GetChunkEndTick(int c, uint32_t bufOrigin, uint64_t windowOffset) {
     if (c < g_numChunks - 1) {
         return ExactChunkOrigin(bufOrigin, windowOffset + c + 1);
@@ -326,8 +306,6 @@ static inline uint32_t GetChunkEndTick(int c, uint32_t bufOrigin, uint64_t windo
 
 static std::atomic<bool> g_paintBusy{ false };
 static std::atomic<bool> g_paintCancel{ false };
-
-// ---- helpers ---------------------------------------------------------------
 static inline uint32_t ToRGBA8(Color c) {
     return (uint32_t)c.r | ((uint32_t)c.g << 8) | ((uint32_t)c.b << 16) | ((uint32_t)c.a << 24);
 }
@@ -341,8 +319,6 @@ struct ReverseCursor {
     std::vector<NoteEvent>::const_iterator cur;
     std::vector<NoteEvent>::const_iterator begin;
     size_t trackIdx;
-
-    // For max-heap (largest startTick at the top)
     bool operator<(const ReverseCursor& other) const {
         return cur->startTick < other.cur->startTick;
     }
@@ -352,10 +328,8 @@ struct ForwardCursor {
     std::vector<NoteEvent>::const_iterator cur;
     std::vector<NoteEvent>::const_iterator end;
     size_t trackIdx;
-
-    // For min-heap (smallest startTick at the top)
     bool operator<(const ForwardCursor& other) const {
-        return cur->startTick > other.cur->startTick; // Inverted for min-heap
+        return cur->startTick > other.cur->startTick;
     }
 };
 
@@ -365,12 +339,8 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
     const int    W    = g_chunkW;
     const int    base = chunkIdx * W;
     const double ppt  = g_pixPerTick;
-
-    // 1. Clear chunk memory segment
     for (int y = 0; y < PIX_H; ++y)
         std::memset(&g_pixBuf[(size_t)y * g_texW + base], 0, (size_t)W * sizeof(uint32_t));
-
-    // 2. Pre-allocate flat rows (thread-local to avoid runtime reallocation)
     thread_local std::vector<uint32_t> rowColors[128];
     for (int y = 0; y < 128; ++y) {
         rowColors[y].assign(W, 0u);
@@ -425,8 +395,6 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 if (++cancelCheckCounter % 8192 == 0) {
                     if (g_paintCancel.load(std::memory_order_relaxed)) return;
                 }
-
-                // Extract track cursor with the largest startTick
                 std::pop_heap(heap.begin(), heap.end());
                 ReverseCursor top = heap.back();
                 heap.pop_back();
@@ -436,8 +404,6 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
 
                 if (n.note < 128) {
                     uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
-                    
-                    // Truncate based on the start tick of the next note on this pitch
                     uint32_t clippedEnd = std::min(rawEnd, pitchNextStart[n.note]);
                     
                     pitchNextStart[n.note] = n.startTick;
@@ -514,8 +480,6 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 if (++cancelCheckCounter % 8192 == 0) {
                     if (g_paintCancel.load(std::memory_order_relaxed)) return;
                 }
-
-                // Extract track cursor with the smallest startTick
                 std::pop_heap(heapF.begin(), heapF.end());
                 ForwardCursor top = heapF.back();
                 heapF.pop_back();
@@ -691,17 +655,11 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
             }
         }
     }
-
-    // 3. Thread-safe copy to active global pixel buffer
-    {
-        std::lock_guard<std::mutex> lk(g_pixBufMtx);
-        for (int y = 0; y < PIX_H; ++y) {
-            uint32_t* dst = g_pixBuf.data() + (size_t)y * g_texW + base;
-            std::memcpy(dst, rowColors[y].data(), W * sizeof(uint32_t));
-        }
+    std::lock_guard<std::mutex> lk(g_pixBufMtx);
+    for (int y = 0; y < PIX_H; ++y) {
+        uint32_t* dst = g_pixBuf.data() + (size_t)y * g_texW + base;
+        std::memcpy(dst, rowColors[y].data(), W * sizeof(uint32_t));
     }
-
-    // 4. Thread-safe update of atomic counters
     renderNotes.store(count, std::memory_order_relaxed);
     uint64_t currentMax = maxRenderNotes.load(std::memory_order_relaxed);
     while (count > currentMax && !maxRenderNotes.compare_exchange_weak(currentMax, count, std::memory_order_relaxed));
@@ -744,11 +702,6 @@ static void BgPaintThreadFunc()
     }
 }
 
-// Real streaming/load progress of the background chunk-paint pipeline:
-// how many of the g_numChunks texture chunks are currently painted & valid,
-// plus whether the worker thread still has jobs in flight. This is the
-// actual "is PaintChunkRange caught up" signal — distinct from renderNotes/
-// maxRenderNotes, which only tracks note density within a single chunk.
 struct ChunkStreamStatus {
     int  paintedChunks;
     int  totalChunks;
@@ -813,14 +766,8 @@ void DrawStreamingVisualizerNotes(
         static_cast<uint32_t>((ScrollSpeed * 1500000.0) / uspt));
     const float  plx = (float)sw * 0.5f;
     const double ppt = (double)(sw - plx) / (double)viewWindow;
-
-    // Defensive clamp: g_numChunks is user-adjustable at runtime via the Options
-    // slider (2-16). Clamp here before it's used for any array indexing below —
-    // g_chunkPainted/g_chunkOriginTick are fixed at MAX_CHUNKS, so an out-of-range
-    // value (e.g. from a future JSON load) must never reach the indexing below.
     g_numChunks = std::clamp(g_numChunks, 2, MAX_CHUNKS);
 
-    // --- Strict Hardware Texture Cap Implementation ---
     constexpr int MAX_GPU_TEXTURE_WIDTH = 16384;
     int newChunkW = sw * 2;
     if (newChunkW * g_numChunks > MAX_GPU_TEXTURE_WIDTH) {
@@ -870,22 +817,16 @@ void DrawStreamingVisualizerNotes(
 
     g_tracks = &tracks;
     g_bgViewerType = viewerType;
-
-    // Visible tick window boundaries
     int64_t  sLeft = (int64_t)currentTick - (int64_t)(plx / ppt);
     int64_t  sRight = (int64_t)currentTick + (int64_t)((sw - plx) / ppt) + 1;
     uint64_t leftTick = (uint64_t)std::max((int64_t)0, sLeft);
 
     bool seeked = g_seekInvalidate.exchange(false);
-
-    // Check if visible window is outside our rendered texture buffer bounds
     bool outOfBounds = (leftTick < g_chunkOriginTick[0]) || 
                        (leftTick >= g_chunkOriginTick[g_numChunks - 1]);
 
     if (seeked || g_rtNeedsFullRedraw || outOfBounds) {
         g_rtNeedsFullRedraw = false;
-
-        // Cancel and wait for background paint thread to safely pause
         g_paintCancel.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(g_paintMtx);
@@ -903,24 +844,18 @@ void DrawStreamingVisualizerNotes(
         }
 
         g_paintCancel.store(false, std::memory_order_release);
-
         {
             std::lock_guard<std::mutex> lk(g_pixBufMtx);
             std::memset(g_pixBuf.data(), 0, g_pixBuf.size() * sizeof(uint32_t));
         }
-
-        // Synchronously paint Chunk 0 on the main thread so visible notes appear instantly
         uint32_t c0ts = GetChunkStartTick(0, g_bufOriginTick, 0);
         uint32_t c0te = GetChunkEndTick(0, g_bufOriginTick, 0);
         PaintChunkRange(0, c0ts, c0te);
         g_chunkPainted[0] = true;
-
         {
             std::lock_guard<std::mutex> lk(g_pixBufMtx);
             UpdateTexture(g_tex, g_pixBuf.data());
         }
-
-        // Enqueue remaining lookahead chunks (1..g_numChunks-1) for background thread
         for (int nc = 1; nc < g_numChunks; ++nc) {
             uint32_t cts = GetChunkStartTick(nc, g_bufOriginTick, 0);
             uint32_t cte = GetChunkEndTick(nc, g_bufOriginTick, 0);
@@ -928,7 +863,6 @@ void DrawStreamingVisualizerNotes(
         }
     }
     else {
-        // Upload finished chunks to GPU
         int lp = g_lastPaintedChunk.exchange(-1, std::memory_order_acquire);
         if (lp >= 0) {
             std::lock_guard<std::mutex> lk(g_pixBufMtx);
@@ -937,7 +871,6 @@ void DrawStreamingVisualizerNotes(
 
         // ---- SMOOTH SLIDING WINDOW SHIFT ----
         if (leftTick >= g_chunkOriginTick[1]) {
-            // Cancel background painter before modifying pixel memory
             g_paintCancel.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(g_paintMtx);
@@ -988,8 +921,6 @@ void DrawStreamingVisualizerNotes(
         float dstX = 0.f;
         float blitW = (float)sw;
         double srcX = (double)(sLeft - (int64_t)g_bufOriginTick) * g_pixPerTick;
-
-        // At the start of playback (sLeft < 0), Tick 0 aligns at dstX on screen
         if (sLeft < 0) {
             dstX  = (float)(-(double)sLeft * ppt);
             blitW = (float)sw - dstX;
@@ -997,8 +928,6 @@ void DrawStreamingVisualizerNotes(
         }
 
         if (srcX < 0.0) srcX = 0.0;
-
-        // Scale texture sampling width to match visible screen width proportionally
         float srcW = blitW * texRatio;
 
         if (srcX + (double)srcW > (double)g_texW) {
@@ -1522,10 +1451,9 @@ void InformationVersion()
 {
     int fontSize = 10;
     int positionY = GetScreenHeight() - 35;
-    DrawText("Version: 1.0.3A (Pre-Release)", 10, positionY, fontSize, GRAY);
+    DrawText("Version: 1.0.4 (Release Soon)", 10, positionY, fontSize, GRAY);
     positionY += 15;
     DrawText("Graphic: raylib 5.5", 10, positionY, fontSize, GRAY);
-    DrawText("NOTICE: The same keys hit after sound issue", GetScreenWidth() / 2 - MeasureText("NOTICE: The same keys hit after sound issue", 10) / 2, GetScreenHeight() - 30, 10, Color {255,255,128,128});
     DrawText("Check terminal after load midi", GetScreenWidth() / 2 - MeasureText("Check terminal after load midi", 10) / 2, GetScreenHeight() - 15, 10, Color {255,255,255,192});
 }
 
@@ -1627,33 +1555,34 @@ static void BuildTempoSegs(int ppq) {
 
 static double TicksToSeconds(uint64_t tick); 
 
-static void BuildNpsGrid(const std::vector<OptimizedTrackData>& tracks, int barWidthPx = 0) {
-    g_npsGrid.clear();
+static void BuildMasterNpsGrid(const std::vector<OptimizedTrackData>& tracks) {
+    g_masterNpsHist.assign(MASTER_NPS_BINS, 0.0f);
     g_npsGridReady = false;
     if (g_songDurationSec <= 0.0 || g_tempoSegs.empty()) return;
 
-    int cells = (barWidthPx > 0) ? std::max(1, barWidthPx / kNpsCellPx) : 126;
-    g_npsGridCells      = cells;
-    g_npsGridBuiltWidth = barWidthPx;
-    g_npsGrid.assign(cells, 0.f);
-
-    double cellSec = g_songDurationSec / cells;
-    std::vector<float> counts(cells, 0.f);
-
+    double binDurationSec = g_songDurationSec / (double)MASTER_NPS_BINS;
+    if (binDurationSec <= 0.0) return;
     for (const auto& track : tracks) {
         for (const auto& n : track.notes) {
             double sec = TicksToSeconds(n.startTick);
-            int cell = (int)(sec / cellSec);
-            if (cell >= 0 && cell < cells) counts[cell]++;
+            int bin = (int)(sec / binDurationSec);
+            if (bin >= 0 && bin < MASTER_NPS_BINS) {
+                g_masterNpsHist[bin] += 1.0f;
+            }
         }
     }
-    float maxNps = 0.f;
-    for (int i = 0; i < cells; ++i) {
-        g_npsGrid[i] = (cellSec > 0.0) ? counts[i] / (float)cellSec : 0.f;
-        maxNps = std::max(maxNps, g_npsGrid[i]);
+    for (int i = 0; i < MASTER_NPS_BINS; ++i) {
+        g_masterNpsHist[i] = (float)((double)g_masterNpsHist[i] / binDurationSec);
     }
-    if (maxNps > 0.f)
-        for (int i = 0; i < cells; ++i) g_npsGrid[i] /= maxNps;
+    float maxNps = 0.0f;
+    for (int i = 0; i < MASTER_NPS_BINS; ++i) {
+        if (g_masterNpsHist[i] > maxNps) maxNps = g_masterNpsHist[i];
+    }
+    if (maxNps > 0.0f) {
+        for (int i = 0; i < MASTER_NPS_BINS; ++i) {
+            g_masterNpsHist[i] /= maxNps;
+        }
+    }
 
     g_npsGridReady = true;
 }
@@ -1768,27 +1697,12 @@ static uint64_t perfEvpsHistory[MAX_PERF_HISTORY] = {0};
 static uint64_t perfEvpsMin = 0, perfEvpsMax = 0;
 static double   perfEvpsAvg = 0.0;
 static uint64_t lastCurrentVisualizerTick = 0;
-
-// Ring buffer write cursor. Points at the most-recently-written (newest) slot.
-// Starts at MAX_PERF_HISTORY - 1 so the very first write lands on index 0.
 static int perfHistHead = MAX_PERF_HISTORY - 1;
-
-// Maps a logical "age" index (0 = oldest sample .. MAX_PERF_HISTORY-1 = newest sample)
-// to its physical slot in the ring buffer. Keeps every existing draw loop working
-// unmodified (they just index perfXHistory[i] in oldest->newest order via this helper).
 static inline int PerfIdx(int age) {
     int idx = perfHistHead + 1 + age;
     idx -= (idx >= MAX_PERF_HISTORY) ? MAX_PERF_HISTORY : 0;
     return idx;
 }
-
-// Updates the rolling performance history. Previously this shifted all 5 history
-// arrays down by one element every single frame (5 * MAX_PERF_HISTORY memmoves/frame,
-// i.e. 2000 element copies/frame just to make room for 1 new sample). A ring buffer
-// turns that into a fixed set of O(1) writes; the min/max/avg scan below is the only
-// remaining O(MAX_PERF_HISTORY) work, and it's unavoidable for a sliding-window
-// min/max without a heavier structure (e.g. a monotonic deque), which isn't worth
-// the complexity at N = 400.
 void UpdatePerformanceHistory(int fps, float ft, int tps, float bufHealth, uint64_t evps, float renderNotesPct) {
     perfHistHead = (perfHistHead + 1 == MAX_PERF_HISTORY) ? 0 : perfHistHead + 1;
 
@@ -1891,28 +1805,28 @@ void DrawPerformanceDebugPanel() {
 
     std::vector<PerfTier> fpsTiers = {
         {0.0f, BLACK}, {0.5f, PDarkerRed}, {1.0f, PDarkerRed}, {5.0f, PDarkRed}, {10.0f, PRed}, 
-        {30.0f, POrange}, {60.0f, PYellow}, {240.0f, PGreen}, {960.0f, PBlue}, 
-        {1920.0f, PCyan}, {3000.0f, PMagenta}, {10000.0f, PWhite}
+        {30.0f, POrange}, {60.0f, PYellow}, {240.0f, PGreen}, {960.0f, PBlue}, {1920.0f, PLightBlue},
+		{3072.0f, PCyan}, {6144.0f, PMagenta}, {10240.0f, PPink}, {20480.0f, PWhite}
     };
     std::vector<PerfTier> ftTiers = {
-        {0.0f, PWhite}, {0.5f, PWhite}, {1.0f, PMagenta}, {2.5f, PCyan}, 
-        {5.0f, PBlue}, {10.0f, PGreen}, {30.0f, PYellow}, {100.0f, POrange}, 
-        {500.0f, PRed}, {1000.0f, PDarkRed}, {30000.0f, PDarkerRed}, {60000.0f, BLACK}
+        {0.0f, PWhite}, {0.5f, PPink}, {1.0f, PMagenta}, {2.5f, PCyan}, {5.0f, PLightBlue},
+		{10.0f, PBlue}, {25.0f, PGreen}, {50.0f, PYellow}, {100.0f, POrange}, {500.0f, PRed},
+		{1000.0f, PDarkRed}, {15000.0f, PDarkerRed}, {60000.0f, BLACK}
     };
 	std::vector<PerfTier> bufTiers = {
         {0.0f, BLACK}, {0.5f, PDarkRed}, {1.0f, PRed}, {5.0f, POrange},
-        {10.0f, PYellow}, {30.0f, PGreen}, {60.0f, PBlue}, {150.0f, PCyan},
-        {300.0f, PMagenta}, {600.0f, PWhite}
+        {10.0f, PYellow}, {30.0f, PGreen}, {60.0f, PBlue}, {120.0f, PLightBlue},
+        {180.0f, PCyan}, {240.0f, PMagenta}, {300.0f, PPink}, {600.0f, PWhite}
     };
     std::vector<PerfTier> tpsTiers = {
         {0.0f, BLACK}, {30.0f, PDarkerRed}, {60.0f, PDarkerRed}, {120.0f, PDarkRed},
 		{240.0f, PRed}, {480.0f, POrange}, {960.0f, PYellow}, {1920.0f, PGreen}, {3840.0f, PBlue},
-        {7680.0f, PCyan}, {15360.0f, PMagenta}, {30720.0f, PWhite}
+        {7680.0f, PLightBlue}, {15360.0f, PCyan}, {30720.0f, PMagenta}, {61440.0f, PPink}, {122880.0f, PWhite}
     };
 	std::vector<PerfTier> evpsTiers = {
-        {0.0f, BLACK}, {10.0f, PRed}, {100.0f, POrange}, {1000.0f, PYellow},
-		{10000.0f, PGreen}, {100000.0f, PBlue}, {1000000.0f, PCyan}, {10000000.0f, PMagenta},
-		{100000000.0f, PWhite}
+        {0.0f, BLACK}, {100.0f, PRed}, {500.0f, POrange}, {1000.0f, PYellow},
+		{5000.0f, PGreen}, {10000.0f, PBlue}, {500000.0f, PLightBlue}, {1000000.0f, PCyan},
+		{5000000.0f, PMagenta}, {10000000.0f, PPink}, {20000000.0f, PWhite} 
     };
 
     DrawText(TextFormat("Graphics - Frames Per Second (Real-Time): %d  (%d / %d / %.0f)", perfFpsHistory[perfHistHead], perfFpsMin, perfFpsMax, perfFpsAvg), cx, cy, 10, WHITE);
@@ -2134,7 +2048,7 @@ int main(int argc, char* argv[]) {
 					std::sort(g_sortedNoteEndTicks.begin(),   g_sortedNoteEndTicks.end());
 					BuildTempoSegs(ppq);
 					g_songDurationSec = TicksToSeconds(g_songLastTick);
-					BuildNpsGrid(noteTracks, (int)(GetScreenWidth() - 20)); 
+					BuildMasterNpsGrid(noteTracks);
 					if (noteTracks.size() == 0) {
 						currentState = STATE_MENU;
 						SendNotification(400, 75, SERROR, "You need to load MIDI files first", 5.0f);
@@ -2165,7 +2079,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "R = Restart playback" << std::endl;
                 std::cout << "J = Start loop" << std::endl;
                 std::cout << "K = End loop" << std::endl;
-                std::cout << "L = Enable loop (Or when midi is finish)" << std::endl << std::endl;
+                std::cout << "L = Enable loop (Or when MIDI is finish)" << std::endl << std::endl;
 
                 std::cout << "- - [ Render ] - -" << std::endl;
                 std::cout << "O = Slower scroll speed (+0.05x)" << std::endl;
@@ -2234,7 +2148,7 @@ int main(int argc, char* argv[]) {
                         g_AudioEngine.Pause();
                     }
                 }
-                if (IsKeyPressed(KEY_BACKSPACE) && (!showOptions)) { 
+                if (IsKeyPressed(KEY_BACKSPACE) && !(showOptions || IsAudioConfigPanelOpen())) { 
                     std::cout << "- Returning menu..." << std::endl; 
                     InvalidateNoteBuffer(); 
                     g_AudioEngine.Stop();
@@ -2250,6 +2164,7 @@ int main(int argc, char* argv[]) {
                     g_sortedNoteEndTicks.clear();
                     g_sortedNoteEndTicks.shrink_to_fit();
                     g_songLastTick = 0; g_songDurationSec = 0.0; g_tempoSegs.clear(); g_maxNps = 0; g_maxPoly = 0; g_npsGridReady = false;
+					g_masterNpsHist.clear();
                     SetWindowTitle("JIDI Player - v1.0.4 (Build: " TOSTRING(BUILD_NUMBER) ")"); 
 					g_Smtc.UpdateMetadata("No played", "JIDI-Player");
 					currentState = STATE_MENU;
@@ -2300,7 +2215,7 @@ int main(int argc, char* argv[]) {
                     }
                     UnloadDroppedFiles(droppedFiles);
                 }
-                if (!showOptions) {
+                if (!(showOptions || IsAudioConfigPanelOpen())) {
                     if (IsKeyPressed(KEY_I) || IsKeyPressedRepeat(KEY_I)) { ScrollSpeed = std::max(0.05f, ScrollSpeed - 0.05f); InvalidateNoteBuffer(); }
                     if (IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) { ScrollSpeed += 0.05f; InvalidateNoteBuffer(); }
                     if (IsKeyPressed(KEY_P)) { ScrollSpeed = 0.50f; InvalidateNoteBuffer(); }
@@ -2504,7 +2419,8 @@ int main(int argc, char* argv[]) {
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
-                float barWidth = 450.0f * smoothedProgress;
+				uint16_t CountTotalProgress = MeasureText(TextFormat("Notes: %s / %s", FormatWithCommas(noteTotal).c_str(), FormatWithCommas(noteTotal).c_str()), 20);
+                float barWidth = ((float)(CountTotalProgress) + 15.0f) * smoothedProgress;
 				float bpmFactor = (currentTempo > 0) ? (60000000.0f / (float)currentTempo / 120.0f) * MidiSpeed : MidiSpeed;
                 BeginDrawing();
                 ClearBackground(g_backgroundColor);
@@ -2542,71 +2458,76 @@ int main(int argc, char* argv[]) {
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, g_viewerType);
                 rlImGuiBegin();
                 if (isHUD) {
-				DrawRectangleRounded({10.0f, 10.0f, 450.0f, 10.0f}, 1.0f, 32, Color{64,96,64,128});
+				DrawRectangleRounded({10.0f, 10.0f, (float)(CountTotalProgress) + 15.0f, 10.0f}, 1.0f, 32, Color{64,96,64,128});
                 DrawRectangleRounded({10.0f, 10.0f, barWidth, 10.0f}, 1.0f, 32, JLIGHTLIME);
+                
+                const float sw        = (float)GetRenderWidth();
+                const float sh        = (float)GetRenderHeight();
+                const float barH      = 10.0f;
+                const float barX      = 10.0f;
+                const float barY      = sh - barH - 10.0f;
+                const float barW      = sw - 20.0f;
+                const float roundness = 1.0f;
+                const int   segments  = 32;
+                DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{64,64,64,128});
+                float timeFrac = (g_songDurationSec > 0.0)
+                    ? (float)(TicksToSeconds(currentVisualizerTick) / g_songDurationSec)
+                    : smoothedProgress;
+                timeFrac = std::clamp(timeFrac, 0.f, 1.f);
+                float blueW = barW * timeFrac;
+                if (blueW > 0.f) {
+                    BeginScissorMode((int)barX, (int)barY, (int)blueW, (int)barH);
+                    DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{128,192,255,255});
+                    EndScissorMode();
+                }
+                if (g_BassEngine.IsInitialized() &&
+                    g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender)
                 {
-                    const float sw        = (float)GetRenderWidth();
-                    const float sh        = (float)GetRenderHeight();
-                    const float barH      = 10.0f;
-                    const float barX      = 10.0f;
-                    const float barY      = sh - barH - 10.0f;
-                    const float barW      = sw - 20.0f;
-                    const float roundness = 1.0f;
-                    const int   segments  = 32;
-                    DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{64,64,64,128});
-                    float timeFrac = (g_songDurationSec > 0.0)
-                        ? (float)(TicksToSeconds(currentVisualizerTick) / g_songDurationSec)
-                        : smoothedProgress;
-                    timeFrac = std::clamp(timeFrac, 0.f, 1.f);
-                    float blueW = barW * timeFrac;
-                    if (blueW > 0.f) {
-                        BeginScissorMode((int)barX, (int)barY, (int)blueW, (int)barH);
-                        DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{128,192,255,255});
+                    double bufHealth = g_BassEngine.GetBufferHealthSeconds();
+                    double curSec    = TicksToSeconds(currentVisualizerTick);
+                    double ahead     = curSec + (bufHealth * MidiSpeed); 
+                    float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)(ahead / g_songDurationSec), 0.f, 1.f) : 0.f;
+                    float greenX = barX + blueW;
+                    float greenW = (barW * aheadFrac) - blueW; 
+                    if (greenW > 0.f) {
+                        BeginScissorMode((int)greenX, (int)barY, (int)greenW, (int)barH);
+                        DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{96,192,96,128});
                         EndScissorMode();
                     }
-                    if (g_BassEngine.IsInitialized() &&
-                        g_BassEngine.GetActiveMode() == AudioMode::BassMIDI_PreRender)
-                    {
-                        double bufHealth = g_BassEngine.GetBufferHealthSeconds();
-                        double curSec    = TicksToSeconds(currentVisualizerTick);
-                        double ahead     = curSec + (bufHealth * MidiSpeed); 
-                        float  aheadFrac = (g_songDurationSec > 0.0) ? std::clamp((float)(ahead / g_songDurationSec), 0.f, 1.f) : 0.f;
-                        float greenX = barX + blueW;
-                        float greenW = (barW * aheadFrac) - blueW; 
-                        if (greenW > 0.f) {
-                            BeginScissorMode((int)greenX, (int)barY, (int)greenW, (int)barH);
-                            DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, Color{96,192,96,128});
-                            EndScissorMode();
-                        }
-                    }
-					{
-                        int curBarW = (int)barW;
-                        if (g_npsGridBuiltWidth != curBarW && g_songDurationSec > 0.0)
-                            BuildNpsGrid(noteTracks, curBarW); 
-                    }
-                    if (g_npsGridReady && g_npsGridCells > 0) {
-                        const float cellW = (float)kNpsCellPx;
-                        for (int i = 0; i < g_npsGridCells; ++i) {
-                            float cellX   = barX + i * cellW;
-                            if (cellX + cellW > barX + barW) break; 
-                            uint8_t alpha = (uint8_t)(g_npsGrid[i] * 128.f);
-                            if (alpha < 1) continue;
-                            Color cellCol = {255, 255, 255, alpha};
-                            BeginScissorMode((int)cellX, (int)barY, kNpsCellPx, (int)barH);
-                            DrawRectangleRounded({barX, barY, barW, barH}, roundness, segments, cellCol);
-                            EndScissorMode();
-                        }
-                    }
-					DrawRectangleRoundedLinesEx({barX, barY, barW, barH}, roundness, segments, 2.0f, Color{32,32,32,128});
-					if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !ImGui::GetIO().WantCaptureMouse) {
-                        Vector2 mp = GetMousePosition();
-                        if (mp.x >= barX && mp.x <= barX + barW && mp.y >= barY && mp.y <= barY + barH) {
-                            float    seekFrac = std::clamp((mp.x - barX) / barW, 0.f, 1.f);
-                            uint64_t seekUs = (uint64_t)((double)seekFrac * g_songDurationSec * 1'000'000.0);
-                            g_AudioEngine.SeekAbsolute(seekUs);
-                            InvalidateNoteBuffer();
-                            lastCounterTick = UINT64_MAX;
-                        }
+                }
+				if (g_npsGridReady && barW > 0.0f) {
+					const float cellW = (float)kNpsCellPx;
+					const int numCells = (int)(barW / cellW);
+					for (int i = 0; i < numCells; ++i) {
+						float cellX = barX + (float)i * cellW;
+						if (cellX + cellW > barX + barW) break;
+						int binStart = (int)(((float)i / (float)numCells) * (float)MASTER_NPS_BINS);
+						int binEnd   = (int)(((float)(i + 1) / (float)numCells) * (float)MASTER_NPS_BINS);
+						binStart = std::clamp(binStart, 0, MASTER_NPS_BINS - 1);
+						binEnd   = std::clamp(binEnd, binStart + 1, MASTER_NPS_BINS);
+						float sumIntensity = 0.0f;
+						for (int b = binStart; b < binEnd; ++b) {
+							sumIntensity += g_masterNpsHist[b];
+						}
+						float avgIntensity = sumIntensity / (float)(binEnd - binStart);
+						float visualIntensity = std::sqrt(avgIntensity);
+						uint8_t alpha = (uint8_t)std::clamp(visualIntensity * 160.0f, 0.0f, 255.0f);
+						if (alpha < 4) continue;
+						Color cellCol = { 255, 255, 255, alpha };
+						BeginScissorMode((int)cellX, (int)barY, (int)cellW, (int)barH);
+						DrawRectangleRounded({ barX, barY, barW, barH }, roundness, segments, cellCol);
+						EndScissorMode();
+					}
+				}
+				DrawRectangleRoundedLinesEx({barX, barY, barW, barH}, roundness, segments, 2.0f, Color{32,32,32,128});
+				if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && !ImGui::GetIO().WantCaptureMouse) {
+                    Vector2 mp = GetMousePosition();
+                    if (mp.x >= barX && mp.x <= barX + barW && mp.y >= barY && mp.y <= barY + barH) {
+                        float    seekFrac = std::clamp((mp.x - barX) / barW, 0.f, 1.f);
+                        uint64_t seekUs = (uint64_t)((double)seekFrac * g_songDurationSec * 1'000'000.0);
+                        g_AudioEngine.SeekAbsolute(seekUs);
+                        InvalidateNoteBuffer();
+                        lastCounterTick = UINT64_MAX;
                     }
                 } 
                 DrawText(TextFormat("Notes: %s / %s", FormatWithCommas(noteCounter).c_str(), FormatWithCommas(noteTotal).c_str()), 10, 23, 20, JLIGHTBLUE);

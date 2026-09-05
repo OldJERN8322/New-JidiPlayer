@@ -217,15 +217,29 @@ void MidiOutputEngine::Resume() {
 
 void MidiOutputEngine::SilenceAllChannels() {
     for (int ch = 0; ch < 16; ++ch) {
-        DispatchMidiOut((0xB0 | ch) | (123 << 8)); 
-        DispatchMidiOut((0xB0 | ch) | (121 << 8)); 
+        DispatchMidiOut((0xB0 | ch) | (64 << 8) | (0 << 16));   // Sustain Pedal OFF (Crucial for stopping held notes)
+        DispatchMidiOut((0xB0 | ch) | (120 << 8));              // All Sound Off (Immediate mute)
+        DispatchMidiOut((0xB0 | ch) | (123 << 8));              // All Notes Off
+        DispatchMidiOut((0xB0 | ch) | (121 << 8));              // Reset All Controllers
+        for (int n = 0; n < 128; ++n) {
+            if (activeNotes[ch][n]) {
+                DispatchMidiOut((0x80 | ch) | (n << 8));
+            }
+        }
     }
     memset(activeNotes, 0, sizeof(activeNotes)); 
 }
 
 void MidiOutputEngine::SilenceAllChannelsWithoutCC() {
     for (int ch = 0; ch < 16; ++ch) {
-        DispatchMidiOut((0xB0 | ch) | (123 << 8));
+        DispatchMidiOut((0xB0 | ch) | (64 << 8) | (0 << 16));   // Sustain Pedal OFF
+        DispatchMidiOut((0xB0 | ch) | (120 << 8));              // All Sound Off
+        DispatchMidiOut((0xB0 | ch) | (123 << 8));              // All Notes Off
+        for (int n = 0; n < 128; ++n) {
+            if (activeNotes[ch][n]) {
+                DispatchMidiOut((0x80 | ch) | (n << 8));
+            }
+        }
     }
     memset(activeNotes, 0, sizeof(activeNotes)); 
 }
@@ -603,8 +617,6 @@ void MidiOutputEngine::PlaybackThread() {
                 if ((uint64_t)event.tick >= loopEndTick.load()) break;
             }
             double scheduledTime = accumulatedMicroseconds + (double)(event.tick - lastProcessedTick) * effectiveMicrosPerTick;    
-            
-            // If the event is in the future: yield instead of sleeping to prevent thread suspension
             if (scheduledTime > (double)elapsedVirtualMicros) {
                 std::this_thread::yield();
                 break; 
@@ -618,14 +630,10 @@ void MidiOutputEngine::PlaybackThread() {
                 simTokens -= 1.0;
                 simLagActive.store(false);
             }
-
-            // Track tick changes to reset per-tick burst cap
             if (event.tick != currentTickBatch) {
                 currentTickBatch = event.tick;
                 noteOnsDispatchedThisTick = 0;
             }
-
-            // Ultra-low latency threshold (1.0ms) OR per-tick Note-On burst limit
             const bool isLate = eventSkipEnabled && (((double)elapsedVirtualMicros - scheduledTime) > 1000.0);
             const bool burstCapHit = eventSkipEnabled && (noteOnsDispatchedThisTick >= kMaxNoteOnsPerTick);
 
@@ -644,23 +652,28 @@ void MidiOutputEngine::PlaybackThread() {
             } else if (!isPreRender) {
                 if (event.type == (uint8_t)EventType::NOTE_ON) {
                     uint8_t ch = event.channel, n = event.getNote(), v = event.getVelocity();
-                    if (s_KdmapiVelIgnore && v > 0 && v <= (uint8_t)s_VelIgnore) {
-                        eventPos++;
-                        continue;
-                    }
+                    
+                    // Standard MIDI: Note-On with velocity 0 is Note-Off
+                    if (v == 0) {
+                        DispatchMidiOut((0x80 | ch) | (n << 8));
+                        activeNotes[ch][n] = false;
+                    } else {
+                        if (s_KdmapiVelIgnore && v <= (uint8_t)s_VelIgnore) {
+                            eventPos++;
+                            continue;
+                        }
 
-                    // KeyDiv Guard + Burst Cap + Lag Skip
-                    if (!isLate && !burstCapHit && !activeNotes[ch][n]) {
-                        DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
-                        activeNotes[ch][n] = (v > 0);
-                        noteOnsDispatchedThisTick++;
+                        // Allow overlapping notes to trigger
+                        if (!isLate && !burstCapHit) {
+                            DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
+                            activeNotes[ch][n] = true;
+                            noteOnsDispatchedThisTick++;
+                        }
                     }
                 } else if (event.type == (uint8_t)EventType::NOTE_OFF) {
                     uint8_t ch = event.channel, n = event.getNote();
-                    if (activeNotes[ch][n]) {
-                        DispatchMidiOut((0x80 | ch) | (n << 8) | (event.getVelocity() << 16));
-                        activeNotes[ch][n] = false;
-                    }
+                    DispatchMidiOut((0x80 | ch) | (n << 8) | (event.getVelocity() << 16));
+                    activeNotes[ch][n] = false;
                 } else if (event.type == (uint8_t)EventType::CC) {
                     DispatchMidiOut((0xB0 | event.channel) | (event.getCCController() << 8) | (event.getCCValue() << 16));
                 } else if (event.type == (uint8_t)EventType::PITCH_BEND) {

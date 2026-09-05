@@ -111,9 +111,11 @@ extern std::string inputBuffer;
 #define POrange			CLITERAL(Color){255, 128, 64, 255}
 #define PYellow			CLITERAL(Color){255, 255, 64, 255}
 #define PGreen			CLITERAL(Color){64, 255, 64, 255}
-#define PCyan			CLITERAL(Color){64, 255, 255, 255}
 #define PBlue			CLITERAL(Color){64, 128, 255, 255}
+#define PLightBlue		CLITERAL(Color){128, 192, 255, 255}
+#define PCyan			CLITERAL(Color){128, 255, 255, 255}
 #define PMagenta		CLITERAL(Color){255, 128, 255, 255}
+#define PPink			CLITERAL(Color){255, 192, 255, 255}
 #define PWhite			CLITERAL(Color){255, 255, 255, 255}
 
 // ===== Enums for State Management =====

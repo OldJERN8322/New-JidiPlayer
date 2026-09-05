@@ -1,12 +1,4 @@
 // load.cpp
-// MIDI file loader — 1:1 memory usage (one streaming pass, no duplicate buffers).
-// Tempo stored/read as 3-byte (uint24) exactly as the MIDI spec mandates.
-// Populates:
-//   std::vector<MidiEvent>          → MidiOutputEngine
-//   std::vector<OptimizedTrackData> → visualizer (NoteEvent note-on/off pairing)
-//   std::vector<CCEvent>            → CC lane data
-//   std::vector<TempoEvent>         → global tempo map
-// ──────────────────────────────────────────────────────────────────────────────
 
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
@@ -110,7 +102,7 @@ struct PendingNote {
     uint8_t  visualTrack; 
 };
 
-} // namespace
+}
 
 static std::vector<MidiEvent> s_globalEvents;
 static std::vector<std::vector<uint8_t>> s_sysexPool;
@@ -273,7 +265,7 @@ std::vector<CCEvent> loadStreamingMidiData(
                 if (statusByte < 0xF0) {
                     runStatus = statusByte;
                 } else {
-                    runStatus = 0; // MIDI Spec: SysEx and Meta cancel running status
+                    runStatus = 0;
                 }
             } else {
                 firstData = statusByte;
@@ -328,8 +320,7 @@ std::vector<CCEvent> loadStreamingMidiData(
             }
 
             if (statusByte == 0xF0 || statusByte == 0xF7) {
-                runStatus = 0; // Cancel running status
-                
+                runStatus = 0;
                 uint32_t sysLen = 0;
                 for (int i = 0; i < 4; ++i) {
                     if (bytesLeft == 0) break;
@@ -421,8 +412,6 @@ std::vector<CCEvent> loadStreamingMidiData(
                     uint8_t ctrl = readData();
                     uint8_t val  = readData();
                     
-                    // Permitted all standard controllers including CC 121 (Reset All Controllers)
-                    // Only drop real-time all-notes-off CC 120/123 to prevent visualizer cutoff
                     if (ctrl == 120 || ctrl == 123) {
                         break;
                     }
@@ -473,8 +462,6 @@ std::vector<CCEvent> loadStreamingMidiData(
                     break;
             }
         }
-
-        // Flush active notes at end-of-track boundary
         for (int ch = 0; ch < 16; ++ch) {
             for (int n = 0; n < 128; ++n) {
                 auto& list = pendingNotes[ch][n];
@@ -504,8 +491,6 @@ std::vector<CCEvent> loadStreamingMidiData(
         progress->currentNotes = totalNoteCount;
         progress->loadPhase = 2; 
     }
-
-    // ── Overlap & Duplicate Remover Filter (Conditional) ────────────────────
     if (removeOverlaps) {
         for (auto& td : tracks) {
             if (td.notes.empty()) continue;
@@ -563,8 +548,6 @@ std::vector<CCEvent> loadStreamingMidiData(
             td.notes.shrink_to_fit();
         }
     }
-
-    // Strict priority ordering: TEMPO (0) -> SYSEX (1) -> NOTE_OFF (2) -> CC (3) -> PROGRAM_CHANGE (4) -> PITCH/PRESS (5) -> NOTE_ON (6)
     std::stable_sort(s_globalEvents.begin(), s_globalEvents.end(),
         [](const MidiEvent& a, const MidiEvent& b) {
             if (a.tick != b.tick) return a.tick < b.tick;
