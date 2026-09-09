@@ -94,6 +94,7 @@ bool showOptions = false;
 bool g_enableOverlapRemove = false; // Toggle for complete overlap removal
 bool g_enableRenderOverlapRemove = false; // Toggle for render overlap removal
 bool g_enableRoundedNotes = false; // Toggle for rounded note end-caps
+bool g_enableCompressedNotes = true; // Toggle for !CompressNote macro expansion
 ViewerType g_viewerType = ViewerType::TickLayer; // T key toggles
 bool g_transparentWindow = false; // Global value before Init Window
 static bool firstPause = true; // Loads do first pause (kept static since it is only used here)
@@ -377,7 +378,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 int backLimit = 0;
                 while (ri != track.notes.begin() && backLimit < 2000) {
                     --ri; backLimit++;
-                    if (ri->endTick <= tickStart) { ++ri; break; }
+                    if (ri->endTick() <= tickStart) { ++ri; break; } // <--- Corrected
                 }
                 ri_start = ri;
 
@@ -403,7 +404,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 size_t t = top.trackIdx;
 
                 if (n.note < 128) {
-                    uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                    uint32_t rawEnd = n.endTick();
                     uint32_t clippedEnd = std::min(rawEnd, pitchNextStart[n.note]);
                     
                     pitchNextStart[n.note] = n.startTick;
@@ -462,7 +463,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 int backLimit = 0;
                 while (ri != track.notes.begin() && backLimit < 2000) {
                     --ri; backLimit++;
-                    if (ri->endTick <= tickStart) { ++ri; break; }
+                    if (ri->endTick() <= tickStart) { ++ri; break; } // <--- Added ()
                 }
                 ri_start = ri;
 
@@ -486,7 +487,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
 
                 const NoteEvent& n = *top.cur;
                 size_t t = top.trackIdx;
-                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t rawEnd = n.endTick();
                 uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
                 uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
 
@@ -537,7 +538,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
             int backLimit = 0;
             while (ri != track.notes.begin() && backLimit < 2000) {
                 --ri; backLimit++;
-                if (ri->endTick <= tickStart) { ++ri; break; }
+                if (ri->endTick() <= tickStart) { ++ri; break; }  // <-- Added ()
             }
             ri_start = ri;
 
@@ -550,7 +551,7 @@ static void PaintChunkRange(int chunkIdx, uint32_t tickStart, uint32_t tickEnd)
                 }
 
                 const NoteEvent& n = *it;
-                uint32_t rawEnd = (n.endTick > n.startTick) ? n.endTick : n.startTick + 1;
+                uint32_t rawEnd = n.endTick();
                 uint32_t ds = (n.startTick > tickStart) ? n.startTick : tickStart;
                 uint32_t de = (rawEnd < tickEnd)        ? rawEnd      : tickEnd;
 
@@ -2012,8 +2013,7 @@ int main(int argc, char* argv[]) {
 					g_LoadProgress.Reset(); 
 					g_LoaderThread = std::thread([&]() {
 						int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal,
-						timeSigNumerator, timeSigDenominator, &g_LoadProgress, g_enableOverlapRemove);
+						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal, timeSigNumerator, timeSigDenominator, &g_LoadProgress, g_enableOverlapRemove, g_enableCompressedNotes);
 						ppq = (uint16_t)iPpq;
 						currentTempo = (uint32_t)iTempo;
 						MidiLoadUsage = GetMemoryUsage();
@@ -2040,10 +2040,11 @@ int main(int argc, char* argv[]) {
 					for (const auto& track : noteTracks) {
 						for (const auto& note : track.notes) {
 							g_sortedNoteStartTicks.push_back(note.startTick);
-							g_sortedNoteEndTicks.push_back(note.endTick);
-							if (note.endTick > g_songLastTick) g_songLastTick = note.endTick;
+							uint32_t eTick = note.endTick();
+							g_sortedNoteEndTicks.push_back(eTick);
+							if (eTick > g_songLastTick) g_songLastTick = eTick;
 						}
-                    }
+					}
 					std::sort(g_sortedNoteStartTicks.begin(), g_sortedNoteStartTicks.end());
 					std::sort(g_sortedNoteEndTicks.begin(),   g_sortedNoteEndTicks.end());
 					BuildTempoSegs(ppq);
@@ -2422,6 +2423,8 @@ int main(int argc, char* argv[]) {
 				uint16_t CountTotalProgress = MeasureText(TextFormat("Notes: %s / %s", FormatWithCommas(noteTotal).c_str(), FormatWithCommas(noteTotal).c_str()), 20);
                 float barWidth = ((float)(CountTotalProgress) + 15.0f) * smoothedProgress;
 				float bpmFactor = (currentTempo > 0) ? (60000000.0f / (float)currentTempo / 120.0f) * MidiSpeed : MidiSpeed;
+				const float topBarMaxW = (float)(CountTotalProgress) + 15.0f;
+				float currentFillW = std::clamp(barWidth, 0.0f, topBarMaxW);
                 BeginDrawing();
                 ClearBackground(g_backgroundColor);
 
@@ -2458,8 +2461,12 @@ int main(int argc, char* argv[]) {
                 DrawStreamingVisualizerNotes(noteTracks, currentVisualizerTick, ppq, currentTempo, g_viewerType);
                 rlImGuiBegin();
                 if (isHUD) {
-				DrawRectangleRounded({10.0f, 10.0f, (float)(CountTotalProgress) + 15.0f, 10.0f}, 1.0f, 32, Color{64,96,64,128});
-                DrawRectangleRounded({10.0f, 10.0f, barWidth, 10.0f}, 1.0f, 32, JLIGHTLIME);
+				DrawRectangleRounded({10.0f, 10.0f, topBarMaxW, 10.0f}, 1.0f, 32, Color{64, 96, 64, 128});
+				if (currentFillW > 0.0f) {
+					BeginScissorMode(10, 10, (int)currentFillW, 10);
+					DrawRectangleRounded({10.0f, 10.0f, topBarMaxW, 10.0f}, 1.0f, 32, JLIGHTLIME);
+					EndScissorMode();
+				}
                 
                 const float sw        = (float)GetRenderWidth();
                 const float sh        = (float)GetRenderHeight();
@@ -2558,7 +2565,7 @@ int main(int argc, char* argv[]) {
                     if (ImGui::Begin("Options [F9]", &showOptions, wflags)) {
 						if (ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
 				 
-								if (ImGui::Checkbox("Enable Tempo Override", &IsTempoOverride)) {
+								if (ImGui::Checkbox("Enable Tempo Control", &IsTempoOverride)) {
 								float baseBpm = (currentTempo > 0) ? (60000000.0f / (float)currentTempo) : 120.0f;
 								if (IsTempoOverride) {
 									TempoSet = baseBpm * MidiSpeed;
@@ -2767,6 +2774,11 @@ int main(int argc, char* argv[]) {
                             ImGui::Checkbox("Transparent Window", &g_transparentWindow);
                             if (ImGui::IsItemHovered()) {
 								ImGui::SetTooltip("Enable Transparent Window, Be may requires restart application.");
+							}
+							
+							ImGui::Checkbox("Compressed Notes", &g_enableCompressedNotes);
+							if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Parses !CompressNote(<Multiplier>, <Track>) and !UncompressNote(<Track>)\nmacro text events. Requires reloading the MIDI file.");
 							}
 							
 							ImGui::Separator();

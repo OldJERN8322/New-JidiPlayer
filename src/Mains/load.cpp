@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <cassert>
 #include <deque>
+#include <unordered_map>
+#include <cctype>
 
 namespace {
 
@@ -104,6 +106,67 @@ struct PendingNote {
 
 }
 
+static bool ParseCompressCommand(const char* text, size_t len, int currentTrack, uint64_t& outMultiplier, int& outTargetTrack) {
+    if (len < 9) return false;
+
+    // Search for "!compress" (case-insensitive)
+    std::string s(text, len);
+    std::string lower = s;
+    for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+
+    size_t posComp = lower.find("!compress");
+    size_t posUncomp = lower.find("!uncompress");
+
+    if (posUncomp != std::string::npos) {
+        outMultiplier = 1;
+        outTargetTrack = -1; // -1 = apply to all or current
+        size_t openP = lower.find('(', posUncomp);
+        if (openP != std::string::npos) {
+            size_t closeP = lower.find(')', openP);
+            std::string inside = lower.substr(openP + 1, (closeP != std::string::npos) ? (closeP - openP - 1) : std::string::npos);
+            int trk = 0;
+            if (sscanf(inside.c_str(), "%d", &trk) >= 1) {
+                outTargetTrack = trk;
+            }
+        }
+        std::cout << "[TextEvent] Detected !UncompressNote -> Target Track: " << outTargetTrack << std::endl;
+        return true;
+    }
+
+    if (posComp != std::string::npos) {
+        size_t openP = lower.find('(', posComp);
+        if (openP != std::string::npos) {
+            size_t closeP = lower.find(')', openP);
+            std::string inside = lower.substr(openP + 1, (closeP != std::string::npos) ? (closeP - openP - 1) : std::string::npos);
+
+            // Replace commas and colons with spaces for easy extraction
+            for (char& c : inside) {
+                if (c == ',' || c == ':' || c == ';') c = ' ';
+            }
+
+            unsigned long long mult = 1;
+            int trk = -1; // -1 means apply to all / current track
+            int parsed = sscanf(inside.c_str(), "%llu %d", &mult, &trk);
+            if (parsed >= 1) {
+                outMultiplier = mult > 0 ? (uint64_t)mult : 1ULL;
+                outTargetTrack = trk; // can be -1 if no track given
+                std::cout << "[TextEvent] Found !CompressNote: Multiplier = " << outMultiplier 
+                          << ", Target Track = " << outTargetTrack 
+                          << " (Current MIDI Track = " << currentTrack << ")" << std::endl;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct CompressNote {
+    uint32_t tick;
+    int      targetTrack; // -1 = global / all tracks, or specific 1-based track
+    uint64_t multiplier;  // 1 = uncompressed, >1 = compressed
+};
+static std::vector<CompressNote> s_CompressNote;
+
 static std::vector<MidiEvent> s_globalEvents;
 static std::vector<std::vector<uint8_t>> s_sysexPool;
 
@@ -185,13 +248,14 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
     std::stable_sort(tempos.begin(), tempos.end(),
         [](const TempoEvent& a, const TempoEvent& b){ return a.tick < b.tick; });
     return tempos;
+	
 }
 
 std::vector<CCEvent> loadStreamingMidiData(
     const std::string& filename, std::vector<OptimizedTrackData>& tracks,
     int& ppq, int& initialTempo, uint64_t& totalNoteCount,
     uint16_t& outTimeSigNumerator, uint16_t& outTimeSigDenominator,
-    LoadProgress* progress, bool removeOverlaps) {
+    LoadProgress* progress, bool removeOverlaps, bool expandCompressedNotes) {
     if (progress) progress->loadPhase = 1;
     MidiReader r(filename, progress ? &progress->bytesRead : nullptr);
     if (progress) progress->totalBytes = r.totalSize;
@@ -203,6 +267,7 @@ std::vector<CCEvent> loadStreamingMidiData(
 
     s_globalEvents.clear();
     s_sysexPool.clear();
+    s_CompressNote.clear();
 
     if (r.totalSize > 0) {
         size_t estimatedEvents = r.totalSize / 4; 
@@ -306,6 +371,24 @@ std::vector<CCEvent> loadStreamingMidiData(
                         outTimeSigNumerator   = nn;
                         outTimeSigDenominator = (uint16_t)(1u << dd); 
                     }
+                } else if (expandCompressedNotes && (metaType == 0x01 || metaType == 0x02 || metaType == 0x03 || metaType == 0x06 || metaType == 0x07)) {
+                    if (metaLen > 0 && bytesLeft >= metaLen && metaLen < 1024) {
+                        std::vector<char> txtBuf(metaLen + 1);
+                        r.readBytes(txtBuf.data(), metaLen);
+                        txtBuf[metaLen] = '\0';
+                        bytesLeft -= metaLen;
+
+                        uint64_t multiplier = 1;
+                        int targetTrack = -1;
+                        if (ParseCompressCommand(txtBuf.data(), metaLen, (int)trackIdx, multiplier, targetTrack)) {
+                            // Record with the exact tick
+                            s_CompressNote.push_back({ absTick, targetTrack, multiplier });
+                        }
+                    } else {
+                        if (metaLen > 0 && bytesLeft >= metaLen) {
+                            r.skip(metaLen); bytesLeft -= metaLen;
+                        }
+                    }
                 } else if (metaType == 0x2F) {
                     if (metaLen > 0 && bytesLeft >= metaLen) {
                         r.skip(metaLen); bytesLeft -= metaLen;
@@ -362,25 +445,47 @@ std::vector<CCEvent> loadStreamingMidiData(
                 uint8_t v = r.readU8(); bytesLeft--;
                 return v;
             };
+			
+			// Fast timeline query: what multiplier is active for track/channel at 'tick'?
+            auto GetCompressNote = [&](uint32_t tick, int trk, int ch) -> uint64_t {
+                if (!expandCompressedNotes || s_CompressNote.empty()) return 1ULL;
+                uint64_t mult = 1ULL;
+                for (const auto& m : s_CompressNote) {
+                    if (m.tick > tick) break; // Haven't reached this tick yet
+                    if (m.targetTrack == -1 || m.targetTrack == trk || m.targetTrack == (ch + 1)) {
+                        mult = m.multiplier;
+                    }
+                }
+                return mult;
+            };
 
             auto doNoteOff = [&](uint8_t note) {
-                MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
-                ev.setNote(note, 0);
-                s_globalEvents.push_back(ev);
-
                 auto& list = pendingNotes[channel][note];
                 if (!list.empty()) {
                     const PendingNote& oldest = list.front();
-                    NoteEvent ne{};
-                    ne.startTick   = oldest.startTick;
-                    ne.endTick     = absTick;
-                    ne.note        = note;
-                    ne.velocity    = oldest.velocity;
-                    ne.channel     = channel;
-                    ne.visualTrack = oldest.visualTrack;
-                    tracks[vtrack].notes.push_back(ne);
-                    totalNoteCount++;
-                    if (progress && (totalNoteCount % 500 == 0)) {
+
+                    // Query the active multiplier using GetCompressNote
+                    uint64_t mult = GetCompressNote(oldest.startTick, (int)trackIdx, channel);
+
+                    uint32_t dur = (absTick > oldest.startTick) ? (absTick - oldest.startTick) : 1u;
+                    if (dur > 65535u) dur = 65535u;
+
+                    for (uint64_t m = 0; m < mult; ++m) {
+                        MidiEvent ev(absTick, EventType::NOTE_OFF, channel);
+                        ev.setNote(note, 0);
+                        s_globalEvents.push_back(ev);
+
+                        NoteEvent ne{};
+                        ne.startTick   = oldest.startTick;
+                        ne.duration    = (uint16_t)dur;
+                        ne.note        = note;
+                        ne.channel     = channel & 0x0F;
+                        ne.visualTrack = (uint8_t)(vtrack & 0x0F);
+                        tracks[vtrack].notes.push_back(ne);
+                        totalNoteCount++;
+                    }
+
+                    if (progress && (totalNoteCount % 10000 == 0)) {
                         progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
                     list.pop_front();
@@ -400,9 +505,14 @@ std::vector<CCEvent> loadStreamingMidiData(
                     if (vel == 0) {
                         doNoteOff(note); 
                     } else {
-                        MidiEvent ev(absTick, EventType::NOTE_ON, channel);
-                        ev.setNote(note, vel);
-                        s_globalEvents.push_back(ev);
+                        // Query the active multiplier at this start tick:
+                        uint64_t mult = GetCompressNote(absTick, (int)trackIdx, channel);
+
+                        for (uint64_t m = 0; m < mult; ++m) {
+                            MidiEvent ev(absTick, EventType::NOTE_ON, channel);
+                            ev.setNote(note, vel);
+                            s_globalEvents.push_back(ev);
+                        }
                         
                         pendingNotes[channel][note].push_back(PendingNote{ absTick, vel, vtrack });
                     }
@@ -466,17 +576,19 @@ std::vector<CCEvent> loadStreamingMidiData(
             for (int n = 0; n < 128; ++n) {
                 auto& list = pendingNotes[ch][n];
                 for (auto& pn : list) {
+                    uint32_t dur = (absTick > pn.startTick) ? (absTick - pn.startTick) : 1u;
+                    if (dur > 65535u) dur = 65535u;
+
                     NoteEvent ne{};
-                    ne.startTick  = pn.startTick;
-                    ne.endTick    = absTick;   
-                    ne.note       = n;
-                    ne.velocity   = pn.velocity;
-                    ne.channel    = ch;
-                    ne.visualTrack= pn.visualTrack;
-                    if (ne.visualTrack < (uint8_t)tracks.size())
-                        tracks[ne.visualTrack].notes.push_back(ne);
+                    ne.startTick   = pn.startTick;
+                    ne.duration    = (uint16_t)dur;
+                    ne.note        = n;
+                    ne.channel     = ch & 0x0F;
+                    ne.visualTrack = (uint8_t)(pn.visualTrack & 0x0F);
+                    if (pn.visualTrack < (uint8_t)tracks.size())
+                        tracks[pn.visualTrack].notes.push_back(ne);
                     totalNoteCount++;
-                    if (progress && (totalNoteCount % 500 == 0)) {
+                    if (progress && (totalNoteCount % 10000 == 0)) {
                         progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
                 }
@@ -500,7 +612,7 @@ std::vector<CCEvent> loadStreamingMidiData(
                     if (a.note != b.note) return a.note < b.note;
                     if (a.channel != b.channel) return a.channel < b.channel;
                     if (a.startTick != b.startTick) return a.startTick < b.startTick;
-                    return a.endTick > b.endTick;
+                    return a.endTick() > b.endTick();
                 });
 
             std::vector<NoteEvent> cleanNotes;
@@ -512,14 +624,16 @@ std::vector<CCEvent> loadStreamingMidiData(
                 auto& last = cleanNotes.back();
 
                 if (last.note == next.note && last.channel == next.channel) {
+                    if (last.startTick == next.startTick && last.endTick() == next.endTick()) {
+                        cleanNotes.push_back(next);
+                        continue;
+                    }
                     if (last.startTick == next.startTick) {
                         continue; 
                     }
-                    if (last.endTick > next.startTick) {
-                        last.endTick = next.startTick;
-                    }
-                    if (last.endTick <= last.startTick) {
-                        last.endTick = last.startTick + 1;
+                    if (last.endTick() > next.startTick) {
+                        uint32_t newDur = (next.startTick > last.startTick) ? (next.startTick - last.startTick) : 1u;
+                        last.duration = (uint16_t)std::min<uint32_t>(newDur, 65535u);
                     }
                 }
                 cleanNotes.push_back(next);

@@ -122,17 +122,22 @@ extern std::string inputBuffer;
 enum AppState { STATE_MENU, STATE_LOADING, STATE_PLAYING };
 
 // ===== Data Structures =====
-// NoteEvent: naturally 12 bytes with zero padding (4+4+1+1+1+1).
-// No #pragma pack needed — fields already align perfectly.
-// DO NOT add pack(1) here: it breaks SIMD auto-vectorization in the renderer.
+// NoteEvent: exactly 8 bytes (32-bit start tick + 16-bit duration + 8-bit pitch + 8-bit bitfield)
+// Zero padding. Leaves plenty of room for notes up to 65,535 ticks long.
 struct NoteEvent {
-    uint32_t startTick;   // 4  offset 0
-    uint32_t endTick;     // 4  offset 4
-    uint8_t  note;        // 1  offset 8
-    uint8_t  velocity;    // 1  offset 9
-    uint8_t  channel;     // 1  offset 10
-    uint8_t  visualTrack; // 1  offset 11 → total 12 bytes, zero padding
+    uint32_t startTick;        // Offset 0 (4 bytes)
+    uint16_t duration;         // Offset 4 (2 bytes)
+    uint8_t  note;             // Offset 6 (1 byte)
+    uint8_t  channel : 4;  // Offset 7 (4 bits: 0..15)
+    uint8_t  visualTrack : 4;  // Offset 7 (4 bits: 0..15)
+
+    // Inline helper so all existing code using 'endTick' still works seamlessly!
+    inline uint32_t endTick() const {
+        return startTick + (duration > 0 ? (uint32_t)duration : 1u);
+    }
 };
+
+static_assert(sizeof(NoteEvent) == 8, "NoteEvent must be exactly 8 bytes!");
 
 struct CCEvent {
     uint32_t tick;
@@ -203,8 +208,7 @@ std::vector<CCEvent> loadStreamingMidiData(
     const std::string& filename, std::vector<OptimizedTrackData>& tracks,
     int& ppq, int& initialTempo, uint64_t& totalNoteCount,
     uint16_t& outTimeSigNumerator, uint16_t& outTimeSigDenominator,
-    LoadProgress* progress,
-    bool removeOverlaps); 
+    LoadProgress* progress, bool removeOverlaps, bool expandCompressedNotes);
 
 std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 
@@ -228,6 +232,7 @@ extern ViewerType g_viewerType;
 extern bool g_enableOverlapRemove;
 extern bool g_enableRenderOverlapRemove;
 extern bool g_enableRoundedNotes;
+extern bool g_enableCompressedNotes;
 
 extern float g_bgColorF[4];
 extern Color g_backgroundColor;
