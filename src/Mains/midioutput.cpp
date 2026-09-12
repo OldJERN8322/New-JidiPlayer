@@ -518,8 +518,7 @@ void MidiOutputEngine::SeekAbsolute(uint64_t targetMicros) {
 
 void MidiOutputEngine::RecordDispatch(uint64_t count) {
     auto    now     = std::chrono::steady_clock::now();
-    int64_t nowMs   = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          now.time_since_epoch()).count();
+    int64_t nowMs   = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     int     cur     = m_evpsCurBucket.load(std::memory_order_relaxed);
     int64_t bStart  = m_evpsBuckets[cur].startMs.load(std::memory_order_relaxed);
     if (bStart < 0 || nowMs - bStart >= 10) {
@@ -578,27 +577,33 @@ void MidiOutputEngine::PlaybackThread() {
         };
 
         uint64_t elapsedVirtualMicros = sampleElapsedVirtualMicros();
+        const int64_t eps = simulateEventsPerSecond.load(std::memory_order_relaxed);
+        bool isThrottled = (eps > 0) && !isPreRender;
 
-        double microsSinceLastEvent = ((double)elapsedVirtualMicros > accumulatedMicroseconds)
-            ? (double)elapsedVirtualMicros - accumulatedMicroseconds : 0.0;
-        double effectiveMicrosPerTick = microsecondsPerTick;
-        const int64_t eps = simulateEventsPerSecond.load();
-        if (eps > 0 && simLagActive.load() && !simLagSmooth.load()) {
-            microsSinceLastEvent = 0.0; 
+        if (isThrottled) {
+            auto nowSim = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(nowSim - simLastRefill).count();
+            simLastRefill = nowSim;
+
+            const double burstCap = (double)eps * 0.010;
+            simTokens = std::min(simTokens + (dt * (double)eps), burstCap);
         }
+
+        double microsSinceLastEvent = 0.0;
+        if (isThrottled && simLagActive.load() && !simLagSmooth.load()) {
+            microsSinceLastEvent = 0.0;
+        } else {
+            microsSinceLastEvent = ((double)elapsedVirtualMicros > accumulatedMicroseconds)
+                ? (double)elapsedVirtualMicros - accumulatedMicroseconds : 0.0;
+        }
+
+        double effectiveMicrosPerTick = microsecondsPerTick;
         if (effectiveMicrosPerTick > 0.0) {
             uint64_t rawVizTick = lastProcessedTick + (uint64_t)(microsSinceLastEvent / effectiveMicrosPerTick);
             if (hasLoopPoints.load() && isLooping.load())
                 currentVisualizerTick = std::min(rawVizTick, loopEndTick.load());
             else
                 currentVisualizerTick = rawVizTick;
-        }
-        if (eps > 0) {
-            auto nowSim = std::chrono::steady_clock::now();
-            double dt = std::chrono::duration<double>(nowSim - simLastRefill).count();
-            simLastRefill = nowSim;
-            const double burstCap = (double)eps * 0.002; 
-            simTokens = std::min(simTokens + dt * (double)eps, burstCap);
         }
 
         int processedInBatch = 0;
@@ -616,20 +621,23 @@ void MidiOutputEngine::PlaybackThread() {
             if (hasLoopPoints.load() && isLooping.load()) {
                 if ((uint64_t)event.tick >= loopEndTick.load()) break;
             }
+
             double scheduledTime = accumulatedMicroseconds + (double)(event.tick - lastProcessedTick) * effectiveMicrosPerTick;    
             if (scheduledTime > (double)elapsedVirtualMicros) {
                 std::this_thread::yield();
                 break; 
             }
 
-            if (eps > 0 && !isPreRender) {
+            if (isThrottled) {
                 if (simTokens < 1.0) {
                     simLagActive.store(true);
+                    std::this_thread::yield();
                     break;
                 }
                 simTokens -= 1.0;
                 simLagActive.store(false);
             }
+
             if (event.tick != currentTickBatch) {
                 currentTickBatch = event.tick;
                 noteOnsDispatchedThisTick = 0;
@@ -652,28 +660,17 @@ void MidiOutputEngine::PlaybackThread() {
             } else if (!isPreRender) {
                 if (event.type == (uint8_t)EventType::NOTE_ON) {
                     uint8_t ch = event.channel, n = event.getNote(), v = event.getVelocity();
-                    
-                    // Standard MIDI: Note-On with velocity 0 is Note-Off
                     if (v == 0) {
                         DispatchMidiOut((0x80 | ch) | (n << 8));
-                        activeNotes[ch][n] = false;
                     } else {
-                        if (s_KdmapiVelIgnore && v <= (uint8_t)s_VelIgnore) {
-                            eventPos++;
-                            continue;
-                        }
-
-                        // Allow overlapping notes to trigger
                         if (!isLate && !burstCapHit) {
                             DispatchMidiOut((0x90 | ch) | (n << 8) | (v << 16));
-                            activeNotes[ch][n] = true;
                             noteOnsDispatchedThisTick++;
                         }
                     }
                 } else if (event.type == (uint8_t)EventType::NOTE_OFF) {
                     uint8_t ch = event.channel, n = event.getNote();
                     DispatchMidiOut((0x80 | ch) | (n << 8) | (event.getVelocity() << 16));
-                    activeNotes[ch][n] = false;
                 } else if (event.type == (uint8_t)EventType::CC) {
                     DispatchMidiOut((0xB0 | event.channel) | (event.getCCController() << 8) | (event.getCCValue() << 16));
                 } else if (event.type == (uint8_t)EventType::PITCH_BEND) {
@@ -691,65 +688,16 @@ void MidiOutputEngine::PlaybackThread() {
             eventPos++;
             if (eventCounterRecordEnabled.load(std::memory_order_relaxed)) {
                 dispatchAccumulator++;
-                if (dispatchAccumulator >= 2048) {
+                if (dispatchAccumulator >= 4096) {
                     RecordDispatch(dispatchAccumulator);
                     dispatchAccumulator = 0;
                 }
             }
         }
-        if (dispatchAccumulator > 0) {
+
+        if (eventCounterRecordEnabled.load(std::memory_order_relaxed) && dispatchAccumulator > 0) {
             RecordDispatch(dispatchAccumulator);
             dispatchAccumulator = 0;
         }
-        if (eps > 0 && simLagActive.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        if (hasLoopPoints.load() && isLooping.load() && threadRunning && !isPaused) {
-            uint64_t loopEnd = loopEndTick.load();
-            bool nextPastB = (eventPos >= eventList->size()) ||
-                             ((uint64_t)(*eventList)[eventPos].tick >= loopEnd);
-            if (nextPastB) {
-                double loopEndMicros = accumulatedMicroseconds +
-                    (double)((int64_t)loopEnd - (int64_t)lastProcessedTick) * effectiveMicrosPerTick;
-                if ((double)elapsedVirtualMicros >= loopEndMicros) {
-                    LoopBackToTick(loopStartTick.load());
-                    continue;
-                }
-                std::this_thread::yield();
-            }
-        }
-        if (eventPos >= eventList->size()) {
-            if (isLooping.load()) {
-                if (hasLoopPoints.load()) {
-                    LoopBackToTick(loopStartTick.load());
-                } else {
-                    SilenceAllChannels();
-                    accumulatedMicroseconds = 0.0;
-                    lastProcessedTick = 0;
-                    currentVisualizerTick = 0;
-                    eventPos = 0;
-                    uint32_t tempTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-                    if (!eventList->empty() && (*eventList)[0].type == (uint8_t)EventType::TEMPO)
-                        tempTempo = (*eventList)[0].getTempo();
-                    currentTempo = tempTempo;
-                    microsecondsPerTick = MidiTiming::CalculateMicrosecondsPerTick(currentTempo, currentPpq);
-                    ApplyTempoOverride();
-                    simTokens    = 0.0;
-                    simLagActive = false;
-                    simLastRefill = std::chrono::steady_clock::now();
-                    {
-                        std::lock_guard<std::mutex> lock(timingMutex);
-                        playbackStartTime = std::chrono::steady_clock::now();
-                    }
-                    if (g_BassEngine.IsInitialized() &&
-                        g_BassEngine.GetActiveMode() != AudioMode::KDMAPI) {
-                        g_BassEngine.SeekTo(0);
-                        g_BassEngine.Play();
-                    }
-                }
-            } else {
-                isFinished = true;
-            }
-        }
-    }
+	}
 }

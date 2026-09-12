@@ -8,40 +8,163 @@
 #include <cstring>
 #include <stdexcept>
 #include <cassert>
-#include <deque>
+#include <vector>
 #include <unordered_map>
 #include <cctype>
+#include <filesystem>
+
+#ifdef _WIN32
+// Declare Win32 memory-mapping APIs without pulling in <windows.h> to avoid raylib macro collisions
+extern "C" {
+    __declspec(dllimport) void* __stdcall CreateFileA(
+        const char* lpFileName, unsigned long dwDesiredAccess, unsigned long dwShareMode,
+        void* lpSecurityAttributes, unsigned long dwCreationDisposition,
+        unsigned long dwFlagsAndAttributes, void* hTemplateFile);
+    __declspec(dllimport) void* __stdcall CreateFileMappingA(
+        void* hFile, void* lpFileMappingAttributes, unsigned long flProtect,
+        unsigned long dwMaximumSizeHigh, unsigned long dwMaximumSizeLow, const char* lpName);
+    __declspec(dllimport) void* __stdcall MapViewOfFile(
+        void* hFileMappingObject, unsigned long dwDesiredAccess,
+        unsigned long dwFileOffsetHigh, unsigned long dwFileOffsetLow, size_t dwNumberOfBytesToMap);
+    __declspec(dllimport) int   __stdcall UnmapViewOfFile(const void* lpBaseAddress);
+    __declspec(dllimport) int   __stdcall CloseHandle(void* hObject);
+    __declspec(dllimport) int   __stdcall GetFileSizeEx(void* hFile, int64_t* lpFileSize);
+}
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
 struct MidiReader {
-    std::vector<uint8_t> buf;   
+    const uint8_t* data = nullptr;
+    std::vector<uint8_t> heapBuf;
     size_t pos       = 0;
     size_t totalSize = 0;
     std::atomic<size_t>* progressBytes = nullptr;
 
+#ifdef _WIN32
+    void* hFile = (void*)(intptr_t)-1;
+    void* hMap  = nullptr;
+#else
+    int fd = -1;
+#endif
+    bool isMapped = false;
+
+    MidiReader(const MidiReader&) = delete;
+    MidiReader& operator=(const MidiReader&) = delete;
+
     explicit MidiReader(const std::string& path, std::atomic<size_t>* pBytes = nullptr)
         : progressBytes(pBytes)
     {
+#ifdef _WIN32
+        hFile = CreateFileA(path.c_str(), 0x80000000UL /*GENERIC_READ*/, 1UL /*FILE_SHARE_READ*/,
+                            nullptr, 3UL /*OPEN_EXISTING*/, 0x00000080UL /*FILE_ATTRIBUTE_NORMAL*/, nullptr);
+        if (hFile != (void*)(intptr_t)-1 && hFile != nullptr) {
+            int64_t fsize = 0;
+            if (GetFileSizeEx(hFile, &fsize) && fsize > 0) {
+                totalSize = static_cast<size_t>(fsize);
+                hMap = CreateFileMappingA(hFile, nullptr, 0x02UL /*PAGE_READONLY*/, 0, 0, nullptr);
+                if (hMap) {
+                    data = static_cast<const uint8_t*>(MapViewOfFile(hMap, 0x0004UL /*FILE_MAP_READ*/, 0, 0, 0));
+                    if (data) {
+                        isMapped = true;
+                        return;
+                    }
+                }
+            }
+        }
+#else
+        fd = open(path.c_str(), O_RDONLY);
+        if (fd != -1) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                totalSize = static_cast<size_t>(st.st_size);
+                void* map = mmap(nullptr, totalSize, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (map != MAP_FAILED) {
+                    data = static_cast<const uint8_t*>(map);
+                    isMapped = true;
+                    return;
+                }
+            }
+        }
+#endif
+
+        // Fallback: 64-bit standard file reading if mapping is unavailable
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) return;
 
-        fseek(f, 0, SEEK_END);
-        totalSize = static_cast<size_t>(ftell(f));
-        fseek(f, 0, SEEK_SET);
+#if defined(_WIN32)
+        _fseeki64(f, 0, SEEK_END);
+        int64_t sz = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
+#else
+        fseeko(f, 0, SEEK_END);
+        off_t sz = ftello(f);
+        fseeko(f, 0, SEEK_SET);
+#endif
+        if (sz <= 0) {
+            std::error_code ec;
+            auto fs = std::filesystem::file_size(path, ec);
+            if (!ec) sz = static_cast<int64_t>(fs);
+        }
 
-        buf.resize(totalSize);
-        if (totalSize > 0)
-            fread(buf.data(), 1, totalSize, f); 
-
+        if (sz > 0) {
+            totalSize = static_cast<size_t>(sz);
+            try {
+                heapBuf.resize(totalSize);
+                size_t totalRead = 0;
+                constexpr size_t CHUNK = 64 * 1024 * 1024;
+                while (totalRead < totalSize) {
+                    size_t toRead = std::min(CHUNK, totalSize - totalRead);
+                    size_t n = fread(heapBuf.data() + totalRead, 1, toRead, f);
+                    if (n == 0) break;
+                    totalRead += n;
+                }
+                totalSize = totalRead;
+                data = heapBuf.data();
+            } catch (...) {
+                totalSize = 0;
+                data = nullptr;
+            }
+        }
         fclose(f);
+    }
+
+    ~MidiReader() {
+#ifdef _WIN32
+        if (isMapped && data) {
+            UnmapViewOfFile(data);
+            data = nullptr;
+        }
+        if (hMap) {
+            CloseHandle(hMap);
+            hMap = nullptr;
+        }
+        if (hFile && hFile != (void*)(intptr_t)-1) {
+            CloseHandle(hFile);
+            hFile = (void*)(intptr_t)-1;
+        }
+#else
+        if (isMapped && data) {
+            munmap((void*)data, totalSize);
+            data = nullptr;
+        }
+        if (fd != -1) {
+            close(fd);
+            fd = -1;
+        }
+#endif
     }
 
     bool eof() const { return pos >= totalSize; }
 
     bool readBytes(void* dst, size_t n) {
-        if (pos + n > totalSize) return false;
-        std::memcpy(dst, buf.data() + pos, n);
+        if (!data || pos + n > totalSize) return false;
+        std::memcpy(dst, data + pos, n);
         pos += n;
         if (progressBytes && (pos % 4096 == 0))
             progressBytes->store(pos, std::memory_order_relaxed);
@@ -49,50 +172,50 @@ struct MidiReader {
     }
 
     uint8_t readU8() {
-        if (pos >= totalSize) return 0;
-        uint8_t v = buf[pos++];
+        if (!data || pos >= totalSize) return 0;
+        uint8_t v = data[pos++];
         if (progressBytes && (pos % 4096 == 0))
             progressBytes->store(pos, std::memory_order_relaxed);
         return v;
     }
 
     uint16_t readU16() {
-        if (pos + 2 > totalSize) return 0;
-        uint16_t v = (static_cast<uint16_t>(buf[pos]) << 8) | buf[pos + 1];
+        if (!data || pos + 2 > totalSize) return 0;
+        uint16_t v = (static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1];
         pos += 2;
         return v;
     }
 
     uint32_t readU32() {
-        if (pos + 4 > totalSize) return 0;
-        uint32_t v = (static_cast<uint32_t>(buf[pos    ]) << 24)
-                   | (static_cast<uint32_t>(buf[pos + 1]) << 16)
-                   | (static_cast<uint32_t>(buf[pos + 2]) <<  8)
-                   |  static_cast<uint32_t>(buf[pos + 3]);
+        if (!data || pos + 4 > totalSize) return 0;
+        uint32_t v = (static_cast<uint32_t>(data[pos    ]) << 24)
+                   | (static_cast<uint32_t>(data[pos + 1]) << 16)
+                   | (static_cast<uint32_t>(data[pos + 2]) <<  8)
+                   |  static_cast<uint32_t>(data[pos + 3]);
         pos += 4;
         return v;
     }
 
     uint32_t readU24() {
-        if (pos + 3 > totalSize) return 0;
-        uint32_t v = (static_cast<uint32_t>(buf[pos    ]) << 16)
-                   | (static_cast<uint32_t>(buf[pos + 1]) <<  8)
-                   |  static_cast<uint32_t>(buf[pos + 2]);
+        if (!data || pos + 3 > totalSize) return 0;
+        uint32_t v = (static_cast<uint32_t>(data[pos    ]) << 16)
+                   | (static_cast<uint32_t>(data[pos + 1]) <<  8)
+                   |  static_cast<uint32_t>(data[pos + 2]);
         pos += 3;
         return v;
     }
 
     uint32_t readVLQ() {
         uint32_t val = 0;
-        for (int i = 0; i < 4 && pos < totalSize; ++i) {
-            uint8_t b = buf[pos++];
+        for (int i = 0; i < 4 && data && pos < totalSize; ++i) {
+            uint8_t b = data[pos++];
             val = (val << 7) | (b & 0x7F);
             if (!(b & 0x80)) break;
         }
         return val;
     }
 
-    void skip(uint32_t n) {
+    void skip(uint64_t n) {
         pos += n;
         if (pos > totalSize) pos = totalSize;
     }
@@ -104,12 +227,70 @@ struct PendingNote {
     uint8_t  visualTrack; 
 };
 
+// High-performance ring pool replacing std::deque to eliminate 17M heap allocations
+struct PendingNotePool {
+    std::vector<PendingNote> items;
+    size_t head = 0;
+
+    bool empty() const { return head >= items.size(); }
+    const PendingNote& front() const { return items[head]; }
+    
+    void push_back(const PendingNote& pn) {
+        if (head == items.size()) {
+            items.clear();
+            head = 0;
+        }
+        items.push_back(pn);
+    }
+    
+    void pop_front() {
+        head++;
+        if (head == items.size()) {
+            items.clear();
+            head = 0;
+        }
+    }
+    
+    void clear() {
+        items.clear();
+        head = 0;
+    }
+};
+
+}
+
+static bool ParseTitleSetCommand(const char* text, size_t len, std::string& outTitle) {
+    if (len < 8) return false;
+    std::string s(text, len);
+    std::string lower = s;
+    for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+
+    size_t pos = lower.find("!titleset");
+    if (pos == std::string::npos) pos = lower.find("!title");
+    if (pos != std::string::npos) {
+        size_t openP = s.find('(', pos);
+        if (openP != std::string::npos) {
+            size_t closeP = s.rfind(')');
+            if (closeP != std::string::npos && closeP > openP) {
+                outTitle = s.substr(openP + 1, closeP - openP - 1);
+            } else {
+                outTitle = s.substr(openP + 1);
+            }
+            while (!outTitle.empty() && (outTitle.front() == ' ' || outTitle.front() == '\t'))
+                outTitle.erase(outTitle.begin());
+            while (!outTitle.empty() && (outTitle.back() == ' ' || outTitle.back() == '\t' || outTitle.back() == '\r' || outTitle.back() == '\n'))
+                outTitle.pop_back();
+
+            std::cout << "[TextEvent] Found !TitleSet: \"" << outTitle << "\"" << std::endl;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool ParseCompressCommand(const char* text, size_t len, int currentTrack, uint64_t& outMultiplier, int& outTargetTrack) {
     if (len < 9) return false;
 
-    // Search for "!compress" (case-insensitive)
     std::string s(text, len);
     std::string lower = s;
     for (char& c : lower) c = (char)std::tolower((unsigned char)c);
@@ -119,7 +300,7 @@ static bool ParseCompressCommand(const char* text, size_t len, int currentTrack,
 
     if (posUncomp != std::string::npos) {
         outMultiplier = 1;
-        outTargetTrack = -1; // -1 = apply to all or current
+        outTargetTrack = -1;
         size_t openP = lower.find('(', posUncomp);
         if (openP != std::string::npos) {
             size_t closeP = lower.find(')', openP);
@@ -139,17 +320,16 @@ static bool ParseCompressCommand(const char* text, size_t len, int currentTrack,
             size_t closeP = lower.find(')', openP);
             std::string inside = lower.substr(openP + 1, (closeP != std::string::npos) ? (closeP - openP - 1) : std::string::npos);
 
-            // Replace commas and colons with spaces for easy extraction
             for (char& c : inside) {
                 if (c == ',' || c == ':' || c == ';') c = ' ';
             }
 
             unsigned long long mult = 1;
-            int trk = -1; // -1 means apply to all / current track
+            int trk = -1;
             int parsed = sscanf(inside.c_str(), "%llu %d", &mult, &trk);
             if (parsed >= 1) {
                 outMultiplier = mult > 0 ? (uint64_t)mult : 1ULL;
-                outTargetTrack = trk; // can be -1 if no track given
+                outTargetTrack = trk;
                 std::cout << "[TextEvent] Found !CompressNote: Multiplier = " << outMultiplier 
                           << ", Target Track = " << outTargetTrack 
                           << " (Current MIDI Track = " << currentTrack << ")" << std::endl;
@@ -162,8 +342,8 @@ static bool ParseCompressCommand(const char* text, size_t len, int currentTrack,
 
 struct CompressNote {
     uint32_t tick;
-    int      targetTrack; // -1 = global / all tracks, or specific 1-based track
-    uint64_t multiplier;  // 1 = uncompressed, >1 = compressed
+    int      targetTrack;
+    uint64_t multiplier;
 };
 static std::vector<CompressNote> s_CompressNote;
 
@@ -245,10 +425,9 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename) {
         if (bytesLeft > 0) r.skip((uint32_t)bytesLeft);
     }
 
-    std::stable_sort(tempos.begin(), tempos.end(),
+    std::sort(tempos.begin(), tempos.end(),
         [](const TempoEvent& a, const TempoEvent& b){ return a.tick < b.tick; });
     return tempos;
-	
 }
 
 std::vector<CCEvent> loadStreamingMidiData(
@@ -268,11 +447,18 @@ std::vector<CCEvent> loadStreamingMidiData(
     s_globalEvents.clear();
     s_sysexPool.clear();
     s_CompressNote.clear();
+    g_midiTitle.clear();
+    bool titleSetExplicitly = false;
 
     if (r.totalSize > 0) {
-        size_t estimatedEvents = r.totalSize / 4; 
-        s_globalEvents.reserve(estimatedEvents);
-        ccEvents.reserve(estimatedEvents / 8);     
+        size_t estimatedEvents = r.totalSize / 4;
+        try {
+            s_globalEvents.reserve(estimatedEvents);
+        } catch (...) {}
+        try {
+            // Cap to 1M to prevent reserving 550MB on Black MIDIs with 0 CC events
+            ccEvents.reserve(std::min<size_t>(estimatedEvents / 8, 1000000ULL));
+        } catch (...) {}
     }
 
     if (r.readU32() != 0x4D546864) throw std::runtime_error("Not a MIDI file");
@@ -290,11 +476,14 @@ std::vector<CCEvent> loadStreamingMidiData(
 
     if (r.totalSize > 0 && visualTrackCount > 0) {
         size_t notesPerTrack = (r.totalSize / 16) / (size_t)visualTrackCount;
-        for (auto& td : tracks)
-            td.notes.reserve(std::max<size_t>(notesPerTrack, 1024));
+        for (auto& td : tracks) {
+            try {
+                td.notes.reserve(std::max<size_t>(notesPerTrack, 1024));
+            } catch (...) {}
+        }
     }
 
-    std::deque<PendingNote> pendingNotes[16][128];
+    PendingNotePool pendingNotes[16][128];
 
     for (uint16_t trackIdx = 0; trackIdx < nTracks && !r.eof(); ++trackIdx) {
         uint32_t chunkId  = r.readU32();
@@ -349,8 +538,16 @@ std::vector<CCEvent> loadStreamingMidiData(
                     metaLen = (metaLen << 7) | (b & 0x7F);
                     if (!(b & 0x80)) break;
                 }
-
-                if (metaType == 0x51 && metaLen == 3 && bytesLeft >= 3) {
+                if (metaType == 0x03 && !titleSetExplicitly && trackIdx == 0 && metaLen > 0 && bytesLeft >= metaLen) {
+                    std::vector<char> titleBuf(metaLen + 1);
+                    r.readBytes(titleBuf.data(), metaLen);
+                    titleBuf[metaLen] = '\0';
+                    bytesLeft -= metaLen;
+                    if (titleBuf[0] != '!') {
+                        g_midiTitle = titleBuf.data();
+                        std::cout << "+ Default MIDI Title: " << g_midiTitle << std::endl;
+                    }
+                } else if (metaType == 0x51 && metaLen == 3 && bytesLeft >= 3) {
                     uint32_t tempoVal = r.readU24(); bytesLeft -= 3;
                     if (absTick == 0 && s_globalEvents.empty() &&
                         initialTempo == (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS) {
@@ -371,18 +568,25 @@ std::vector<CCEvent> loadStreamingMidiData(
                         outTimeSigNumerator   = nn;
                         outTimeSigDenominator = (uint16_t)(1u << dd); 
                     }
-                } else if (expandCompressedNotes && (metaType == 0x01 || metaType == 0x02 || metaType == 0x03 || metaType == 0x06 || metaType == 0x07)) {
+                } else if (metaType == 0x01 || metaType == 0x02 || metaType == 0x03 || metaType == 0x06 || metaType == 0x07) {
                     if (metaLen > 0 && bytesLeft >= metaLen && metaLen < 1024) {
                         std::vector<char> txtBuf(metaLen + 1);
                         r.readBytes(txtBuf.data(), metaLen);
                         txtBuf[metaLen] = '\0';
                         bytesLeft -= metaLen;
 
-                        uint64_t multiplier = 1;
-                        int targetTrack = -1;
-                        if (ParseCompressCommand(txtBuf.data(), metaLen, (int)trackIdx, multiplier, targetTrack)) {
-                            // Record with the exact tick
-                            s_CompressNote.push_back({ absTick, targetTrack, multiplier });
+                        std::string customTitle;
+                        if (ParseTitleSetCommand(txtBuf.data(), metaLen, customTitle)) {
+                            g_midiTitle = customTitle;
+                            titleSetExplicitly = true;
+                        }
+
+                        if (expandCompressedNotes) {
+                            uint64_t multiplier = 1;
+                            int targetTrack = -1;
+                            if (ParseCompressCommand(txtBuf.data(), metaLen, (int)trackIdx, multiplier, targetTrack)) {
+                                s_CompressNote.push_back({ absTick, targetTrack, multiplier });
+                            }
                         }
                     } else {
                         if (metaLen > 0 && bytesLeft >= metaLen) {
@@ -445,13 +649,12 @@ std::vector<CCEvent> loadStreamingMidiData(
                 uint8_t v = r.readU8(); bytesLeft--;
                 return v;
             };
-			
-			// Fast timeline query: what multiplier is active for track/channel at 'tick'?
+
             auto GetCompressNote = [&](uint32_t tick, int trk, int ch) -> uint64_t {
                 if (!expandCompressedNotes || s_CompressNote.empty()) return 1ULL;
                 uint64_t mult = 1ULL;
                 for (const auto& m : s_CompressNote) {
-                    if (m.tick > tick) break; // Haven't reached this tick yet
+                    if (m.tick > tick) break;
                     if (m.targetTrack == -1 || m.targetTrack == trk || m.targetTrack == (ch + 1)) {
                         mult = m.multiplier;
                     }
@@ -463,8 +666,6 @@ std::vector<CCEvent> loadStreamingMidiData(
                 auto& list = pendingNotes[channel][note];
                 if (!list.empty()) {
                     const PendingNote& oldest = list.front();
-
-                    // Query the active multiplier using GetCompressNote
                     uint64_t mult = GetCompressNote(oldest.startTick, (int)trackIdx, channel);
 
                     uint32_t dur = (absTick > oldest.startTick) ? (absTick - oldest.startTick) : 1u;
@@ -505,7 +706,6 @@ std::vector<CCEvent> loadStreamingMidiData(
                     if (vel == 0) {
                         doNoteOff(note); 
                     } else {
-                        // Query the active multiplier at this start tick:
                         uint64_t mult = GetCompressNote(absTick, (int)trackIdx, channel);
 
                         for (uint64_t m = 0; m < mult; ++m) {
@@ -575,7 +775,8 @@ std::vector<CCEvent> loadStreamingMidiData(
         for (int ch = 0; ch < 16; ++ch) {
             for (int n = 0; n < 128; ++n) {
                 auto& list = pendingNotes[ch][n];
-                for (auto& pn : list) {
+                while (!list.empty()) {
+                    const auto& pn = list.front();
                     uint32_t dur = (absTick > pn.startTick) ? (absTick - pn.startTick) : 1u;
                     if (dur > 65535u) dur = 65535u;
 
@@ -591,6 +792,7 @@ std::vector<CCEvent> loadStreamingMidiData(
                     if (progress && (totalNoteCount % 10000 == 0)) {
                         progress->currentNotes.store(totalNoteCount, std::memory_order_relaxed);
                     }
+                    list.pop_front();
                 }
                 list.clear();
             }
@@ -607,7 +809,7 @@ std::vector<CCEvent> loadStreamingMidiData(
         for (auto& td : tracks) {
             if (td.notes.empty()) continue;
 
-            std::stable_sort(td.notes.begin(), td.notes.end(),
+            std::sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     if (a.note != b.note) return a.note < b.note;
                     if (a.channel != b.channel) return a.channel < b.channel;
@@ -616,7 +818,9 @@ std::vector<CCEvent> loadStreamingMidiData(
                 });
 
             std::vector<NoteEvent> cleanNotes;
-            cleanNotes.reserve(td.notes.size());
+            try {
+                cleanNotes.reserve(td.notes.size());
+            } catch (...) {}
             cleanNotes.push_back(td.notes[0]);
 
             for (size_t i = 1; i < td.notes.size(); ++i) {
@@ -641,7 +845,7 @@ std::vector<CCEvent> loadStreamingMidiData(
 
             td.notes = std::move(cleanNotes);
 
-            std::stable_sort(td.notes.begin(), td.notes.end(),
+            std::sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     return a.startTick < b.startTick;
                 });
@@ -655,14 +859,16 @@ std::vector<CCEvent> loadStreamingMidiData(
     } else {
         for (auto& td : tracks) {
             if (td.notes.empty()) continue;
-            std::stable_sort(td.notes.begin(), td.notes.end(),
+            std::sort(td.notes.begin(), td.notes.end(),
                 [](const NoteEvent& a, const NoteEvent& b){
                     return a.startTick < b.startTick;
                 });
             td.notes.shrink_to_fit();
         }
     }
-    std::stable_sort(s_globalEvents.begin(), s_globalEvents.end(),
+
+    // In-place sort prevents allocating 4.4GB of duplicate temporary memory
+    std::sort(s_globalEvents.begin(), s_globalEvents.end(),
         [](const MidiEvent& a, const MidiEvent& b) {
             if (a.tick != b.tick) return a.tick < b.tick;
             
@@ -679,12 +885,16 @@ std::vector<CCEvent> loadStreamingMidiData(
                     default:                          return 7;
                 }
             };
-            return pri(a.type) < pri(b.type);
+            int pa = pri(a.type);
+            int pb = pri(b.type);
+            if (pa != pb) return pa < pb;
+            if (a.channel != b.channel) return a.channel < b.channel;
+            return a.data < b.data;
         });
 
     s_globalEvents.shrink_to_fit(); 
 
-    std::stable_sort(ccEvents.begin(), ccEvents.end(),
+    std::sort(ccEvents.begin(), ccEvents.end(),
         [](const CCEvent& a, const CCEvent& b){
             return a.tick < b.tick;
         });

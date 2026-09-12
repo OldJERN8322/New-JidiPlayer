@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <algorithm>
 
 class MidiOutputEngine {
 public:
@@ -30,6 +31,8 @@ public:
     bool HasLoopPoints()    const;
     uint64_t GetLoopStartTick() const;
     uint64_t GetLoopEndTick()   const;
+	std::atomic<uint64_t> currentPolyphony{0};
+    std::atomic<uint64_t> currentNotesDispatched{0};
 
     // ---------------------------------------------------------------
     // Event Skip / Anti-Slowdown
@@ -49,13 +52,14 @@ public:
     bool IsEventCounterRecordEnabled() const;
 
     // ---------------------------------------------------------------
-    // Lag Simulator
+    // Slowdown Mode (Events Per Second Limiter)
     // ---------------------------------------------------------------
     void    SetSimulateEventsPerSecond(int64_t eps);
     int64_t GetSimulateEventsPerSecond() const;
     bool    IsSimulateLagActive() const;
-    void    SetLagSmoothRender(bool smooth);
-    bool    GetLagSmoothRender() const;
+
+    void SetLagSmoothRender(bool smooth);
+    bool GetLagSmoothRender() const;
 
     // ── Events-per-second counter ──
     std::atomic<uint64_t> eventsDispatchedCounter{ 0 };
@@ -117,13 +121,14 @@ private:
     std::atomic<bool> antiSlowdownEnabled{false};
     std::atomic<bool> eventCounterRecordEnabled{true};
     bool activeNotes[16][128] = {};
-
-    // Lag simulator state
-    std::atomic<int64_t> simulateEventsPerSecond{0};
-    std::atomic<bool>    simLagActive{false};
-    double   simTokens{0.0};
+	
+    // Slowdown mode state
+    std::atomic<int64_t>      simulateEventsPerSecond{ 0 };
+    std::atomic<bool>         simLagActive{ false };
+    std::atomic<bool>         simLagSmooth{ false };
+    double                    simTokens{ 0.0 };
     std::chrono::steady_clock::time_point simLastRefill;
-    std::atomic<bool> simLagSmooth{false};
+
     mutable std::atomic<uint64_t> m_cachedEps{0};
     mutable std::atomic<int64_t>  m_lastEpsUpdateMs{0};
 };

@@ -88,6 +88,7 @@ extern std::string inputBuffer;
 
 // ===== Custom Colors =====
 #define JGRAY          CLITERAL(Color){ 32, 32, 32, 255 }
+#define JDARKGRAY      CLITERAL(Color){ 16, 16, 16, 255 }
 #define JBLACK         CLITERAL(Color){ 8, 8, 8, 255 }
 #define JBG1A          CLITERAL(Color){ 16, 24, 32, 255 }
 #define JBG1B          CLITERAL(Color){ 32, 48, 64, 255 }
@@ -200,7 +201,6 @@ struct MidiEvent {
     }
 };
 
-// Compile-time verification that there is absolutely no padding
 static_assert(sizeof(MidiEvent) == 8, "MidiEvent must be exactly 8 bytes!");
 
 // ===== load.cpp — streaming MIDI parser (1:1 memory, uint24 tempo) =====
@@ -216,6 +216,7 @@ std::vector<TempoEvent> collectGlobalTempoEvents(const std::string& filename);
 // Call after loading; pass directly to MidiOutputEngine::Start().
 const std::vector<MidiEvent>& GetGlobalMidiEvents();
 const std::vector<uint8_t>& GetSysExData(uint32_t index);
+extern std::string g_midiTitle; // Extracted from Meta 0x03 or file name
 
 // ===================================================================
 // GLOBAL CONFIGURATION SETTINGS (Placed at bottom to resolve types)
@@ -254,6 +255,7 @@ extern Color g_bgImageTint;
 extern BgImageFit g_bgImageFit;
 
 extern bool isHUD;
+extern bool isTitle;
 extern bool isLoop;
 extern float ScrollSpeed;
 extern float MidiSpeed;

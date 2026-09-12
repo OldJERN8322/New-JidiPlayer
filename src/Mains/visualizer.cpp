@@ -1,7 +1,7 @@
 #include "visualizer.hpp"
 #include "midi_timing_alt.hpp"
 #include "midioutput.hpp"
-#include "Lagsimulatorpanel.hpp"
+#include "Slowdownmodepanel.hpp" // Replaced Lagsimulatepanel to Slowdownmodepanel
 #include "build_info.hpp"
 #include "smtc_bridge.hpp"
 #include "bass_backend.hpp"       // BassMIDI pre-render engine + DispatchMidiOut
@@ -105,9 +105,11 @@ float MidiSpeed = 1.00f;
 bool IsTempoOverride = false;
 float TempoSet = 120.0f;
 int cursorPos = 0;
+std::string g_midiTitle = "";
 std::atomic<uint64_t> renderNotes{0};
 std::atomic<uint64_t> maxRenderNotes{0};
 bool isHUD = true;
+bool isTitle = true;
 
 // Custom background color (RGBA, normalized [0,1] for ImGui; converted to raylib Color on use)
 float g_bgColorF[4] = { 0.031f, 0.031f, 0.031f, 1.0f }; // default: black
@@ -1563,15 +1565,23 @@ static void BuildMasterNpsGrid(const std::vector<OptimizedTrackData>& tracks) {
 
     double binDurationSec = g_songDurationSec / (double)MASTER_NPS_BINS;
     if (binDurationSec <= 0.0) return;
+
     for (const auto& track : tracks) {
+        size_t segIdx = 0;
+        const size_t numSegs = g_tempoSegs.size();
         for (const auto& n : track.notes) {
-            double sec = TicksToSeconds(n.startTick);
+            while (segIdx + 1 < numSegs && g_tempoSegs[segIdx + 1].tick <= n.startTick) {
+                segIdx++;
+            }
+            const auto& seg = g_tempoSegs[segIdx];
+            double sec = seg.accumSec + (double)(n.startTick - seg.tick) * seg.usPerTick / 1000000.0;
             int bin = (int)(sec / binDurationSec);
             if (bin >= 0 && bin < MASTER_NPS_BINS) {
                 g_masterNpsHist[bin] += 1.0f;
             }
         }
     }
+
     for (int i = 0; i < MASTER_NPS_BINS; ++i) {
         g_masterNpsHist[i] = (float)((double)g_masterNpsHist[i] / binDurationSec);
     }
@@ -1994,6 +2004,7 @@ int main(int argc, char* argv[]) {
     uint16_t ppq = 480;
     uint32_t currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 	uint32_t g_totalTicks = 0;
+	float topBarMaxW = 0;
     bool isFirstCheck = true;
 	g_Smtc.UpdateMetadata("No played", "JIDI-Player");
     while (!WindowShouldClose()) {
@@ -2006,19 +2017,30 @@ int main(int argc, char* argv[]) {
                 EndDrawing();
                 break;
             }
-            case STATE_LOADING: {
+		case STATE_LOADING: {
 				static bool isThreadStarted = false;
 				if (!isThreadStarted) {
 					isThreadStarted = true;
 					g_LoadProgress.Reset(); 
 					g_LoaderThread = std::thread([&]() {
-						int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
-						g_loadedCCEvents = loadStreamingMidiData(selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal, timeSigNumerator, timeSigDenominator, &g_LoadProgress, g_enableOverlapRemove, g_enableCompressedNotes);
-						ppq = (uint16_t)iPpq;
-						currentTempo = (uint32_t)iTempo;
-						MidiLoadUsage = GetMemoryUsage();
-						TotalLoadUsage = GetMemoryUsage();
-						g_LoadProgress.isFinished = true;
+						try {
+							int iPpq = 480, iTempo = (int)MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
+							g_loadedCCEvents = loadStreamingMidiData(
+								selectedMidiFile, noteTracks, iPpq, iTempo, noteTotal, 
+								timeSigNumerator, timeSigDenominator, &g_LoadProgress, 
+								g_enableOverlapRemove, g_enableCompressedNotes);
+							ppq = (uint16_t)iPpq;
+							currentTempo = (uint32_t)iTempo;
+							MidiLoadUsage = GetMemoryUsage();
+							TotalLoadUsage = GetMemoryUsage();
+						} catch (const std::exception& e) {
+							std::cerr << "[Error] MIDI load exception: " << e.what() << std::endl;
+							g_LoadProgress.hasError.store(true, std::memory_order_relaxed);
+						} catch (...) {
+							std::cerr << "[Error] Unknown MIDI load exception" << std::endl;
+							g_LoadProgress.hasError.store(true, std::memory_order_relaxed);
+						}
+						g_LoadProgress.isFinished.store(true, std::memory_order_relaxed);
 					});
 				}
                 BeginDrawing();
@@ -2029,11 +2051,19 @@ int main(int argc, char* argv[]) {
 				if (g_LoadProgress.isFinished) {
 					g_LoaderThread.join(); 
 					isThreadStarted = false; 
+
+				if (g_LoadProgress.hasError) {
+					currentState = STATE_MENU;
+					SendNotification(420, 75, SERROR, "Failed to load MIDI file!\n(Out of memory or file error)", 5.0f);
+					break;
+				}
+
+				try {
 					InitializeTrackColors(static_cast<int>(noteTracks.size()));
 					g_sortedNoteStartTicks.clear();
-					g_sortedNoteStartTicks.reserve(noteTotal);
+					try { g_sortedNoteStartTicks.reserve(noteTotal); } catch (...) {}
 					g_sortedNoteEndTicks.clear();
-					g_sortedNoteEndTicks.reserve(noteTotal);
+					try { g_sortedNoteEndTicks.reserve(noteTotal); } catch (...) {}
 					g_songLastTick = 0;
 					g_maxNps  = 0;
 					g_maxPoly = 0;
@@ -2050,11 +2080,17 @@ int main(int argc, char* argv[]) {
 					BuildTempoSegs(ppq);
 					g_songDurationSec = TicksToSeconds(g_songLastTick);
 					BuildMasterNpsGrid(noteTracks);
-					if (noteTracks.size() == 0) {
-						currentState = STATE_MENU;
-						SendNotification(400, 75, SERROR, "You need to load MIDI files first", 5.0f);
-						break;
-					}
+				} catch (const std::bad_alloc&) {
+					currentState = STATE_MENU;
+					SendNotification(420, 75, SERROR, "Out of Memory while preparing playback!", 5.0f);
+					break;
+				}
+
+				if (noteTracks.size() == 0) {
+					currentState = STATE_MENU;
+					SendNotification(400, 75, SERROR, "You need to load MIDI files first", 5.0f);
+					break;
+				}
 				firstPause = true;
 				currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 				{
@@ -2063,9 +2099,9 @@ int main(int argc, char* argv[]) {
 						currentTempo = evs[0].getTempo(); 
 					g_AudioEngine.Start(evs, ppq, currentTempo);
 				}
-                g_AudioEngine.SetSpeed(MidiSpeed);
-                g_AudioEngine.SetLooping(isLoop);
-                g_AudioEngine.Pause();
+				g_AudioEngine.SetSpeed(MidiSpeed);
+				g_AudioEngine.SetLooping(isLoop);
+				g_AudioEngine.Pause();
                 std::cout << "+ - [ Help controller ] - +" << std::endl << std::endl;
 
                 std::cout << "- - [ Playback ] - -" << std::endl;
@@ -2121,6 +2157,8 @@ int main(int argc, char* argv[]) {
                 else SetWindowTitle(TextFormat("JIDI Player (Build: " TOSTRING(BUILD_NUMBER) ") - %s", GetFileName(selectedMidiFile.c_str())));
 				g_Smtc.UpdateMetadata(GetFileName(selectedMidiFile.c_str()), "JIDI-Player");
                 if (isFirstCheck) {SendNotification(420, 50, SINFORMATION, "Check terminal for show help control", 5.0f); isFirstCheck = false;}
+				uint16_t CountTotalProgress = MeasureText(TextFormat("Notes: %s / %s", FormatWithCommas(noteTotal).c_str(), FormatWithCommas(noteTotal).c_str()), 20);
+				topBarMaxW = (float)(CountTotalProgress) + 15.0f;
 				}
 				break;
 			}
@@ -2132,6 +2170,7 @@ int main(int argc, char* argv[]) {
 					g_maxPoly = 0;
 					InvalidateNoteBuffer(); 
 					g_AudioEngine.Stop();
+					g_AudioEngine.eventsDispatchedCounter.store(0, std::memory_order_relaxed);
 					currentTempo = MidiTiming::DEFAULT_TEMPO_MICROSECONDS;
 					const auto& evs = GetGlobalMidiEvents();
 					if (!evs.empty() && evs[0].type == (uint8_t)EventType::TEMPO)
@@ -2420,10 +2459,8 @@ int main(int argc, char* argv[]) {
                 static float smoothedProgress = 0.000f;
                 float targetProgress = (noteTotal > 0) ? (float)noteCounter / (float)noteTotal : 0.000f;
                 smoothedProgress += (targetProgress - smoothedProgress) * 0.25f;
-				uint16_t CountTotalProgress = MeasureText(TextFormat("Notes: %s / %s", FormatWithCommas(noteTotal).c_str(), FormatWithCommas(noteTotal).c_str()), 20);
-                float barWidth = ((float)(CountTotalProgress) + 15.0f) * smoothedProgress;
+                float barWidth = (float)(topBarMaxW) * smoothedProgress;
 				float bpmFactor = (currentTempo > 0) ? (60000000.0f / (float)currentTempo / 120.0f) * MidiSpeed : MidiSpeed;
-				const float topBarMaxW = (float)(CountTotalProgress) + 15.0f;
 				float currentFillW = std::clamp(barWidth, 0.0f, topBarMaxW);
                 BeginDrawing();
                 ClearBackground(g_backgroundColor);
@@ -2467,7 +2504,6 @@ int main(int argc, char* argv[]) {
 					DrawRectangleRounded({10.0f, 10.0f, topBarMaxW, 10.0f}, 1.0f, 32, JLIGHTLIME);
 					EndScissorMode();
 				}
-                
                 const float sw        = (float)GetRenderWidth();
                 const float sh        = (float)GetRenderHeight();
                 const float barH      = 10.0f;
@@ -2547,14 +2583,19 @@ int main(int argc, char* argv[]) {
                     FormatWithCommas(g_currentNps).c_str(), FormatWithCommas(g_maxNps).c_str(),
                     FormatWithCommas(g_currentPoly).c_str(), FormatWithCommas(g_maxPoly).c_str()),
                     10, 65, 10, JLIGHTBLUE);
-				if (g_AudioEngine.GetSimulateEventsPerSecond() > 0) {
-                    DrawText("[Slowdown Mode]", 10, 79, 10, JLIGHTYELLOW);
-                }
-                if (firstPause) DrawText("Press SPACEBAR to play", GetScreenWidth()/2 - MeasureText("Press SPACEBAR to play", 20)/2, 20, 20, YELLOW);
-                else if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, 20, 20, RED);
+				int64_t simEps = g_AudioEngine.GetSimulateEventsPerSecond();
+				if (simEps > 0) DrawText(TextFormat("[Slowdown Mode: %lld EV/s]", simEps), 10, 79, 10, JLIGHTYELLOW);
+				std::string displayTitle = !g_midiTitle.empty() ? g_midiTitle : GetFileNameWithoutExt(selectedMidiFile.c_str());
+				if (!displayTitle.empty() && isTitle) {
+					uint16_t titleW = MeasureText(displayTitle.c_str(), 20); uint16_t titleX = (GetScreenWidth() - titleW) / 2;
+					DrawText(displayTitle.c_str(), titleX + 1, 36, 20, Color{ 0, 0, 0, 192 });
+					DrawText(displayTitle.c_str(), titleX, 35, 20, JLIGHTBLUE);
+				}
+                if (firstPause) DrawText("Press SPACEBAR to play", GetScreenWidth()/2 - MeasureText("Press SPACEBAR to play", 20)/2, GetScreenHeight() - 55, 20, Color{255,255,128,255});
+                else if (isPaused) DrawText("PAUSED", GetScreenWidth()/2 - MeasureText("PAUSED", 20)/2, GetScreenHeight() - 55, 20, Color{255,128,128,255});
                 if (showDebug) DrawDebugPanel(currentVisualizerTick, ppq, currentTempo, g_AudioEngine.GetEventPos(), GetGlobalMidiEvents().size(), isPaused, ScrollSpeed, noteTracks, isFinished);
 				if (showPerformance) DrawPerformanceDebugPanel();
-                const char* fpsTxt = TextFormat("FPS: %llu", GetFPS());
+                const char* fpsTxt = TextFormat("%llu FPS", GetFPS());
                 DrawText(fpsTxt, (GetScreenWidth() - MeasureText(fpsTxt, 20)) - 10, 10, 20, JLIGHTLIME); }
                 g_NotificationManager.Update();
                 g_NotificationManager.Draw();
@@ -2589,28 +2630,31 @@ int main(int argc, char* argv[]) {
 									g_AudioEngine.SetTempoOverride(true, TempoSet);
 								}
 							}
+							ImGui::Checkbox("Compressed Notes", &g_enableCompressedNotes);
+							if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Parses !CompressNote(<Multiplier>, <Track>) and !UncompressNote(<Track>)\nmacro text events. Requires reloading the MIDI file.");
+							}
+							ImGui::SameLine();
+							if (ImGui::Checkbox("Complete Overlap Remove", &g_enableOverlapRemove)) {}
+                            if (ImGui::IsItemHovered()) {
+								ImGui::SetTooltip("Enable to filter overlaps during parsing.\nNote: Requires reloading the MIDI file to update counters, NPS, and Polyphony.");
+							}
 							ImGui::Separator();
-				 
 							if (ImGui::Checkbox("Enable loop", &isLoop)) {
 								g_AudioEngine.SetLooping(isLoop);
 							}
 							ImGui::TextUnformatted("Loop A/B  (J = Set A, K = Set B)");
-
 							ImGui::Checkbox("Snap to beat", &g_loopSnapToBeats);
 							ImGui::SameLine();
 							ImGui::TextDisabled("(?)");
 							if (ImGui::IsItemHovered())
 								ImGui::SetTooltip("When enabled, A/B points snap to the nearest beat boundary.\nUse the offset fields below to fine-tune.");
-
 							uint64_t tpbDisp = (ppq > 0)
 								? (static_cast<uint64_t>(ppq) * 4u) / (timeSigDenominator ? timeSigDenominator : 4u)
 								: 1u;
 							if (tpbDisp == 0) tpbDisp = 1;
-
 							uint64_t curBeat = currentVisualizerTick / tpbDisp + 1;
-							ImGui::Text("Now: beat %llu  (tick %llu)", (uint64_t)curBeat,
-							            (uint64_t)currentVisualizerTick);
-
+							ImGui::Text("Now: beat %llu  (tick %llu)", (uint64_t)curBeat, (uint64_t)currentVisualizerTick);
 							if (g_loopSnapToBeats) {
 								ImGui::SetNextItemWidth(90.0f);
 								ImGui::DragInt("Offset A##loopA", &g_loopBeatOffsetA, 1.0f, -256, 256, "%+d beat");
@@ -2734,10 +2778,6 @@ int main(int argc, char* argv[]) {
 							ImGui::SameLine();
 							ImGui::Checkbox("Show Beats", &showBeats);
 							
-							if (ImGui::Checkbox("Complete Overlap Remove", &g_enableOverlapRemove)) {}
-                            if (ImGui::IsItemHovered()) {
-								ImGui::SetTooltip("Enable to filter overlaps during parsing.\nNote: Requires reloading the MIDI file to update counters, NPS, and Polyphony.");
-							}
                             if (ImGui::Checkbox("Render Overlap Remove", &g_enableRenderOverlapRemove)) {
 								InvalidateNoteBuffer();
 							}
@@ -2754,6 +2794,24 @@ int main(int argc, char* argv[]) {
 						}
 				 
 						if (ImGui::CollapsingHeader("Display")) {
+							ImGui::Checkbox("HUD", &isHUD);
+							ImGui::SameLine();
+							ImGui::Checkbox("Title", &isTitle);
+							ImGui::SameLine();
+							ImGui::Checkbox("Information", &showDebug);
+							ImGui::SameLine();
+							ImGui::Checkbox("Performance", &showPerformance);
+							bool vsync = IsWindowState(FLAG_VSYNC_HINT);
+							if (ImGui::Checkbox("VSync", &vsync)) {
+								if (vsync) SetWindowState(FLAG_VSYNC_HINT);
+								else       ClearWindowState(FLAG_VSYNC_HINT);
+							}
+							ImGui::SameLine();
+							bool fsNow = IsWindowFullscreen();
+							if (ImGui::Checkbox("Fullscreen", &fsNow)) {
+								ToggleBorderlessWindowed();
+							}
+							ImGui::Separator();
 							ImGui::Text("Background Color");
 							if (ImGui::ColorEdit4("##BgColor", g_bgColorF,
 								ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel)) {
@@ -2774,11 +2832,6 @@ int main(int argc, char* argv[]) {
                             ImGui::Checkbox("Transparent Window", &g_transparentWindow);
                             if (ImGui::IsItemHovered()) {
 								ImGui::SetTooltip("Enable Transparent Window, Be may requires restart application.");
-							}
-							
-							ImGui::Checkbox("Compressed Notes", &g_enableCompressedNotes);
-							if (ImGui::IsItemHovered()) {
-								ImGui::SetTooltip("Parses !CompressNote(<Multiplier>, <Track>) and !UncompressNote(<Track>)\nmacro text events. Requires reloading the MIDI file.");
 							}
 							
 							ImGui::Separator();
@@ -2854,25 +2907,6 @@ int main(int argc, char* argv[]) {
 										(unsigned char)(g_particleColorF[3] * 255.0f)
 									};
 								}
-							}
-							ImGui::Separator();
-							
-							ImGui::Checkbox("HUD", &isHUD);
-							ImGui::SameLine();
-							ImGui::Checkbox("Information", &showDebug);
-							ImGui::SameLine();
-							ImGui::Checkbox("Performance", &showPerformance);
-				 
-							bool vsync = IsWindowState(FLAG_VSYNC_HINT);
-							if (ImGui::Checkbox("VSync", &vsync)) {
-								if (vsync) SetWindowState(FLAG_VSYNC_HINT);
-								else       ClearWindowState(FLAG_VSYNC_HINT);
-							}
-							ImGui::SameLine();
-				 
-							bool fsNow = IsWindowFullscreen();
-							if (ImGui::Checkbox("Fullscreen", &fsNow)) {
-								ToggleBorderlessWindowed();
 							}
 						}
 				 
